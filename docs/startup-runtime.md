@@ -330,6 +330,28 @@ Checks:
   and never substituted; a packed view of a plain R8G8B8A8_UNORM texture and a
   B5G5R5A1 view of a B4G4R4A4 target must be refused.
 
+## Shared-exponent render and unordered-access targets
+
+The packed-target mapping also covers single-sample 2D textures and arrays in
+`R9G9B9E5_SHAREDEXP` (67) that request a render target, a typed UAV, or both.
+When the adapter lacks one of the requested uses and supports all of them for
+`R11G11B10_FLOAT` (26), the stand-in creates format 26. Sampled-only resources,
+depth-stencil, multisampled textures and other dimensions keep format 67.
+The format query also preserves native format 67 where it supports the requested
+uses. [Microsoft Direct3D format specification](https://microsoft.github.io/DirectX-Specs/d3d/D3D12R9G9B9E5Format.html)
+
+The stand-in carries a format-67 tag. RTVs, UAVs and SRVs naming 67 on that
+resource use format 26, including SRVs reconstructed by the translated draw.
+An optimized clear value naming 67 follows the replacement format. A format-67
+view on a native format-67 texture is passed through. A format-67 view on an
+incompatible texture is refused.
+
+Both formats use 32 bits per texel and clamp negative values to zero.
+Format 26 has 6/6/5 mantissa bits with a separate exponent per channel.
+Format 67 has three 9-bit mantissas with a shared exponent. Rendered and
+UAV-written values can round differently. Uploads and copies in the format-67
+bit layout are not converted.
+
 ## Descriptor heap starts that are not addresses
 
 A console executable treats the CPU start of a descriptor heap as an address. A desktop handle is
