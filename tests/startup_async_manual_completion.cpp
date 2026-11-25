@@ -296,7 +296,6 @@ int run(bool system)
     const auto begin = service.at<BeginFn>(slot_begin);
     const auto complete = service.at<CompleteFn>(slot_complete);
     const auto dispatch = service.at<DispatchFn>(slot_dispatch);
-    const auto close = service.at<CloseQueueFn>(slot_close_queue);
 
     struct Queues {
         void* manual{};
@@ -308,11 +307,11 @@ int run(bool system)
             if (immediate) close(service.self, immediate);
         }
     } queues;
-    if (FAILED(create(service.self, mode_manual, mode_manual, &queues.manual)) || !queues.manual) {
-        std::puts("manual completion queue unavailable");
-        return system ? 77 : fail("stand-in queue creation");
+    const HRESULT manual_hr = create(service.self, mode_manual, mode_manual, &queues.manual);
+    if (FAILED(manual_hr) || !queues.manual) {
+        std::printf("manual queue creation returned 0x%08lx\n", static_cast<unsigned long>(manual_hr));
+        return fail("manual completion queue creation");
     }
-    (void)close;
 
     Seen seen;
     Block block{};
@@ -326,7 +325,7 @@ int run(bool system)
     const Phase pending = observe(&block, seen);
     print("pending", pending, seen);
 
-    // Complete on another thread, as a provider's worker would, then let the work port run.
+    // Complete on a provider thread. The work port is empty because Begin did not schedule DoWork.
     std::thread([&] { complete(service.self, &block, S_OK, sizeof payload); }).join();
     const bool work_dispatched = dispatch(service.self, queues.manual, port_work, 0);
     const Phase unpumped = observe(&block, seen);
@@ -334,6 +333,9 @@ int run(bool system)
     std::printf("unpumped   work_port_dispatched=%d provider_result=%u cleanup=%u\n", work_dispatched,
         provider_results.load(), provider_cleanups.load());
 
+    if (work_dispatched) return fail("an unexpected work-port callback ran");
+    if (unpumped.callbacks != 0) return fail("callback ran before the completion port was dispatched");
+    if (provider_results != 0) return fail("provider result was read before completion dispatch");
     const bool dispatched = dispatch(service.self, queues.manual, port_completion, 0);
     const unsigned after_one = seen.callbacks.load();
     const bool again = dispatch(service.self, queues.manual, port_completion, 0);
@@ -346,34 +348,34 @@ int run(bool system)
     // Contrast: the same operation on an immediate completion port runs its callback without dispatch.
     Seen contrast;
     Block immediate_block{};
-    if (FAILED(create(service.self, mode_immediate, mode_immediate, &queues.immediate)) || !queues.immediate) {
-        if (!system) return fail("stand-in immediate queue creation");
-        std::puts("immediate  queue unavailable; contrast skipped");
-    } else {
-        immediate_block.queue = queues.immediate;
-        immediate_block.context = &contrast;
-        immediate_block.callback = on_complete;
-        if (begin(service.self, &immediate_block, nullptr, identity, identity, provider) != S_OK)
-            return fail("Begin did not accept the immediate-port block");
-        std::thread([&] { complete(service.self, &immediate_block, S_OK, sizeof payload); }).join();
-        std::printf("immediate  callbacks=%u consumed=%s\n", contrast.callbacks.load(),
-            contrast.callbacks ? (contrast.match ? "expected" : "mismatch") : "no");
-        if (contrast.callbacks != 1 || !contrast.match)
-            return fail("the immediate-port contrast did not run its callback with the payload");
+    const HRESULT immediate_hr = create(service.self, mode_immediate, mode_immediate, &queues.immediate);
+    if (FAILED(immediate_hr) || !queues.immediate) {
+        std::printf("immediate queue creation returned 0x%08lx\n", static_cast<unsigned long>(immediate_hr));
+        return fail("immediate completion queue creation");
     }
+    immediate_block.queue = queues.immediate;
+    immediate_block.context = &contrast;
+    immediate_block.callback = on_complete;
+    if (begin(service.self, &immediate_block, nullptr, identity, identity, provider) != S_OK)
+        return fail("Begin did not accept the immediate-port block");
+    std::thread([&] { complete(service.self, &immediate_block, S_OK, sizeof payload); }).join();
+    std::printf("immediate  callbacks=%u consumed=%s\n", contrast.callbacks.load(),
+        contrast.callbacks ? (contrast.match ? "expected" : "mismatch") : "no");
+    if (contrast.callbacks != 1 || !contrast.match)
+        return fail("the immediate-port contrast did not run its callback with the payload");
 
     if (pending.status != E_PENDING || pending.callbacks != 0)
         return fail("status before Complete was not E_PENDING with no callback");
-    if (unpumped.callbacks != 0)
-        return fail("callback ran before the completion port was dispatched");
     if (!dispatched || after_one != 1)
         return fail("one completion-port dispatch did not run exactly one callback");
     if (seen.result != S_OK || !seen.match)
         return fail("the callback did not retrieve the synthetic payload");
     if (again || seen.callbacks != 1)
         return fail("a second completion-port dispatch found more work");
-    if (!system && (unpumped.status != S_OK || final_phase.status != S_OK))
-        return fail("stand-in status after Complete was not S_OK");
+    if (unpumped.status != S_OK && (!system || unpumped.status != E_PENDING))
+        return fail("unexpected status after Complete");
+    if (final_phase.status != S_OK)
+        return fail("completion was dispatched but the operation did not succeed");
     if (!system && (unpumped.size != sizeof payload || final_phase.size != 0))
         return fail("stand-in result size was not 8 before and 0 after retrieval");
     std::puts(system ? "PASS: system manual completion port" : "PASS: controlled manual completion port");
