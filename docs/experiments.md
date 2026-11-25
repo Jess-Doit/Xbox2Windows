@@ -3630,8 +3630,8 @@ For a raw UAV output, `--image-descriptor` names this SRV. For a typed image
 output, `--image-srv-descriptor` declares a distinct eight-word SRV descriptor.
 The caller supplies distinct, non-aliasing desktop resources in that combined
 case. Wait for descriptors with `lgkmcnt(0)` and the load with `vmcnt(0)`.
-This profile refuses same-descriptor reads and writes, sample instructions,
-atomics, A16, D16 and non-2D dimensions.
+The explicit-mip SRV path refuses sample instructions, atomics, A16, D16 and
+non-2D dimensions.
 
 The source-built fixture loads red and blue from mip 1 into consecutive VGPRs.
 A full store writes those two words and two distinct constants into 16 unique
@@ -3656,6 +3656,41 @@ ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_gfx1013_image_st
 
 ```bash
 python3 -B tests/compute_mimg_float_store_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
+```
+
+### gfx1013 same-texel UAV loads
+
+For a 2D `R32G32B32A32_FLOAT` image bound at `u0` with `--image-uav-mip 0`,
+one plain `image_load` can read the same descriptor as the store. Both
+instructions use DMASK `0xf`. The load lowers to
+`asuint(outputData[uint2(x, y)])`. Its result VGPRs become available after
+`s_waitcnt vmcnt(0)` under the existing wait rules.
+
+The load must precede the store and name the same two coordinate VGPRs with
+the same values. The translator requires the dispatch X and Y IDs and local
+Z size 1. The caller must dispatch a single Z group and keep accesses in
+bounds. Each lane then reads and writes its own texel. The profile refuses
+neighbour reads, shared destinations, a second UAV load, sparse masks, a16,
+d16, array and volume views, and explicit-mip reads from the UAV descriptor.
+The separate SRV path continues to require a distinct descriptor and resource.
+
+The fixture rotates RGBA to GBAR in 16 texels and compares every word of all
+three destination mips. It checks 1,344 words, including 1,280 unchanged
+sentinels. Replacing the load with zero causes 64 mismatches. The fixture
+requires `TypedUAVLoadAdditionalFormats` and typed-load and typed-store support
+for this format. A missing capability reports skip 77. The readback uses
+normal binary32 values. NaNs, denormals, out-of-bounds behavior and native
+console execution are outside the measurement.
+[D3D12 typed UAV loads](https://learn.microsoft.com/en-us/windows/win32/direct3d12/typed-unordered-access-view-loads)
+
+```powershell
+cmake --build --preset dev --target offscreen_check -j 2
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_gfx1013_image_uav_load_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/compute_mimg_image_uav_load_check.py
+python3 -B tests/compute_mimg_image_uav_load_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
 ```
 
 ### gfx1013 2D image atomics

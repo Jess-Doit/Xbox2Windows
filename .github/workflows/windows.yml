@@ -65,6 +65,7 @@ jobs:
               (["tests/pixel_attribute_sampled_check.py", *COMMON_LLVM], {}),
               (["tests/compute_mimg_msaa_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
               (["tests/compute_mimg_float_store_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
+              (["tests/compute_mimg_image_uav_load_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
               (["tests/compute_image_atomics_gfx1013_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
               (["tests/mesh_indexed_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_multi_check.py", *COMMON_LLVM], {}),
