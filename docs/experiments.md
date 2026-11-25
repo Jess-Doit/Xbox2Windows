@@ -4365,8 +4365,8 @@ For a raw UAV output, `--image-descriptor` names this SRV. For a typed image
 output, `--image-srv-descriptor` declares a distinct eight-word SRV descriptor.
 The caller supplies distinct, non-aliasing desktop resources in that combined
 case. Wait for descriptors with `lgkmcnt(0)` and the load with `vmcnt(0)`.
-The explicit-mip SRV path refuses sample instructions, atomics, A16, D16 and
-non-2D dimensions.
+The 2D explicit-mip SRV path refuses sample instructions, atomics, A16 and
+D16.
 
 The source-built fixture loads red and blue from mip 1 into consecutive VGPRs.
 A full store writes those two words and two distinct constants into 16 unique
@@ -4457,6 +4457,36 @@ ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_gfx1013_image_st
 
 ```bash
 python3 -B tests/compute_mimg_float_store_layers_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
+```
+
+### gfx1013 1D float image stores and mip loads
+
+For `R32G32B32A32_FLOAT` 1D images, declare `--image-uav-dimension 1d`
+for the mip-zero destination and `--image-srv-dimension 1d` with a separate
+`--image-srv-descriptor` for the source. The view declarations must match the
+instructions. The store binds `RWTexture1D<float4>` at `u0` and uses one
+full-width address VGPR for X. The explicit-mip load binds `Texture1D<float4>`
+at `t0` and uses two consecutive VGPRs for `Load(int2(x, mip))`. RDNA 2 ISA
+§8.2.3, Table 42 specifies these operands, and LLVM 15 assembles both forms.
+[AMD RDNA 2 ISA](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content)
+
+The fixture copies all four channels from source mips 1 and 2, selecting the
+mip by lane, into eight distinct texels of destination mip 0. The comparator
+checks all 224 words across destination mips of widths 32, 16 and 8, including
+192 sentinel words. Forcing source mip 0 changes 32 words. Shifting destination
+X by one changes 36. Both 1D operations require DMASK `0xf`. The translation
+controls also refuse A16, D16, 1D arrays, `image_store_mip`, plain
+`image_load`, 1D atomics, same-descriptor reads, wrong view dimensions and
+gfx1030. The fixture uses normal binary32 values and in-bounds coordinates.
+
+```powershell
+cmake --build --preset dev --target offscreen_check -j 2
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_gfx1013_image_store_1d_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/compute_mimg_float_store_1d_check.py
+python3 -B tests/compute_mimg_float_store_1d_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
 ```
 
 ### gfx1013 2D D16 float image stores
