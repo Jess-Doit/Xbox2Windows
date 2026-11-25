@@ -4391,6 +4391,37 @@ python3 -B tests/compute_mimg_image_uav_load_check.py
 python3 -B tests/compute_mimg_image_uav_load_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
 ```
 
+### gfx1013 2D array and 3D float image stores
+
+For full-mask `R32G32B32A32_FLOAT` stores at mip zero, declare
+`--image-uav-dimension 2d-array` or `3d`. The dimension must match the native
+`image_store` form. The translator binds `RWTexture2DArray<float4>` or
+`RWTexture3D<float4>` at `u0` and indexes it with three consecutive
+full-width address VGPRs in X, Y and slice or depth order. Bind the matching
+UAV view and supply a unique destination texel for each invocation. The
+opt-in covers stores with DMASK `0xf` and no explicit mip operand.
+
+Each source-built case writes 64 texels across two slices or depth planes at
+mip zero, with distinct data derived from X, Y and the third coordinate.
+The comparator checks every word of every slice and mip. The array check
+covers 5,376 words across four layers at each mip. The volume check covers
+4,672 words across mips with depths 4, 2 and 1. The swapped-coordinate control
+exchanges Y with the last coordinate while keeping the values the same.
+The translation controls refuse an incorrect view dimension, a sparse mask and an array or
+volume view on gfx1030. A 2D `image_load_mip` from the separate SRV followed by a 2D array
+store translates to the two views. The translator does not clamp the slice or depth
+coordinate. A D3D12 UAV store outside the view is dropped, and the console's behaviour for
+an out-of-range layer has not been measured.
+
+```powershell
+cmake --build --preset dev --target offscreen_check -j 2
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_gfx1013_image_store_layers_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/compute_mimg_float_store_layers_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
+```
+
 ### gfx1013 2D D16 float image stores
 
 Declare `--image-format R16G16B16A16_FLOAT` and `--image-uav-mip 0`
