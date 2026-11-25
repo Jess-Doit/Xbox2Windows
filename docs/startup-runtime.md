@@ -395,7 +395,7 @@ Then:
 
 ```powershell
 .\tools\startup\run.ps1 -Exe <folder>\<title>.exe -DataDir <package root> -LogDir out\startup\run1 `
-    -Seconds 180 -Render -FakeUser -GpuMirror -ContinueAsserts 1000 -InputScript "4@70"
+    -Seconds 180 -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000 -InputScript "4@70"
 ```
 
 `run.ps1` copies the stand-ins next to the executable and starts `tools/startup/debug_launch.py`.
@@ -447,6 +447,36 @@ It writes:
 | `<log>/events.txt` | module loads and every exception with its time |
 | `<log>/stderr.txt` | the stand-ins' logs (`x2w-d3d12`, `x2w-dstorage`, `x2w-xmem`, `x2w-runtime`, ...) |
 | `<log>/files.txt` | every file the process opened |
+| `<log>/translate.txt` | with `-Translate`: one line per shader request translated during the run |
+
+### Translating shaders during a run
+
+With `-Render -Translate`, `run.ps1` starts `tools/startup/gfx2hlsl.py --watch <shader cache>` beside
+the debugger and stops it, with its worker processes, when the debugger returns (`-Translate`
+without `-Render` is ignored with a warning). The watcher repeats the `--pending` scan every
+2 seconds (`--watch <dir> <seconds>` sets another interval), so a pipeline the title creates during
+the run is translated within seconds, and the runtime picks it up on a later draw instead of on the
+next run. The cache persists: a later run reads every published `<key>.txt` and translates only new
+requests. The watcher's first pass retries every earlier failure once, so a translator update reaches
+requests that failed in an earlier run; after that, a request whose `<key>.fail` is newer than its
+ready marker is not retried during the run (the runtime writes each request once and never rewrites
+it). The one-shot `--pending` scan retries every failure. An unexpected translator error is written
+to `<key>.fail` as `translator error: ...` instead of stopping the scan. A worker killed from outside
+(for example out of memory) ends that watcher pass only; its requests are retried on the next pass.
+FXC is located as described for `X2W_SHADER_CACHE` under [Switches](#switches). A scan with more than
+one pending request translates them in parallel processes, one per logical processor (at most 61 on
+Windows, the `ProcessPoolExecutor` limit) unless `X2W_TRANSLATE_JOBS` sets the count; each request
+writes only its own files. On a 16-thread host,
+3,513 requests (132 translated, 3,381 refused) took 56.9 s with one process and 7.8 s in parallel,
+with byte-identical results.
+
+Check with `python3 -B tests/startup_gfx2hlsl_watch_check.py` (ctest `startup_gfx2hlsl_watch`): a
+request without its ready marker is not consumed, the watcher retries an earlier failure once and
+then leaves failures alone, it translates a request written while it runs, four parallel workers
+print the same results and write the same failures as one, an unexpected translator error becomes
+`<key>.fail`, and an invalid `X2W_TRANSLATE_JOBS` falls back to the processor count.
+`startup_run_ps1` checks that `-Translate` starts the watcher on the cache and stops it together
+with a child process.
 
 `run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
 the process could not be created, 0 when the debugger finished its report, whatever the process
@@ -731,7 +761,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
-| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running. Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
+| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
@@ -739,6 +769,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
+| `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
@@ -1409,6 +1440,18 @@ These are measured on one executable; treat them as hypotheses for others.
   reason of each refusal. Its `_dest_alpha_control` run, which expects a destination alpha factor
   in its colour form, is the negative control
   (`ctest --preset dev --no-tests=error -R "^startup_cb_blend_decode" -V`).
+- Depth-stencil registers are decoded but not applied yet (#1999, item A). State block A of a
+  slot 57 pipeline holds `DB_DEPTH_CONTROL` at +0xB8, `DB_STENCIL_CONTROL` at +0xBC and
+  `DB_STENCILREFMASK` / `_BF` at +0xC0 / +0xC4, measured locally. Other pipeline layouts are not
+  covered. `src/startup_stubs/pipeline_state_decode.h`
+  reads the four words and decodes them into a `D3D12_DEPTH_STENCIL_DESC` and a stencil reference
+  with the field layouts of Mesa's `src/amd/registers/gfx10.json`. It refuses stencil ops D3D12
+  can't express (`ONES`, `REPLACE_OP`, the logic ops, add or subtract by other than one) and colour
+  writes tied to the depth result. It flags, without applying, `DEPTH_BOUNDS_ENABLE` and back-face
+  masks or references that differ from the front. A device-free check decodes hand-built words for
+  each compare function and each stencil op with a D3D12 form, the refusals and a synthetic block.
+  Its `_offset_control` run (words one word later) is the negative control
+  (`ctest --preset dev --no-tests=error -R "^startup_pipeline_state" -V`).
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 

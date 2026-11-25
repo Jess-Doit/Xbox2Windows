@@ -258,11 +258,9 @@ def check_pending_manifest_upgrade(failures):
         ps.unlink()
         with mock.patch.object(StubPipeline, 'manifest', return_value='updated bindings\n'):
             with mock.patch.object(os, 'replace', side_effect=reject_manifest_publish):
-                try:
-                    pending(str(fxc))
-                except PermissionError:
-                    pass
-                else:
+                # translate_one records unexpected I/O errors as <key>.fail instead of ending the scan.
+                result = pending(str(fxc))
+                if 'translator error: PermissionError' not in result:
                     failures.append('pending did not attempt to publish the changed manifest')
             if manifest.exists():
                 failures.append('failed publication left an old manifest beside the new bytecode')

@@ -368,6 +368,7 @@ def controls():
     salu_i32_controls()
     mbcnt_controls()
     bcnt_exec_controls()
+    bfe_controls()
     vadd_nc_i32_controls()
     cvt_u32_f32_controls()
     ff1_exec_controls()
@@ -2321,6 +2322,191 @@ def vadd_nc_i32_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"vadd_nc_i32: mutation '{label}' escaped detection")
+    return 0
+
+
+BFE = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s4, 0x8000f5a3",
+    "s_mov_b32 s5, 0x140014",
+    "s_bfe_u32 s16, s4, 0x80008",
+    "s_bfe_i32 s17, s4, 0x80008",
+    "s_bfe_i32 s18, s4, 0xff80ffe8",
+    "s_bfe_u32 s19, s4, s5",
+    "s_bfe_i32 s20, s4, s5",
+    "s_bfe_i32 s21, -1, 0x200000",
+    "s_bfe_u32 s22, s20, 0xff80ffe0",
+    "s_bfe_u32 s23, s4, 0x100010",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_add_nc_u32_e32 v4, s16, v3",
+    "v_add_nc_u32_e32 v5, s17, v3",
+    "v_xor_b32_e32 v6, s19, v3",
+    "v_xor_b32_e32 v6, s20, v6",
+    "v_add_nc_u32_e32 v7, s18, v3",
+    "v_add_nc_u32_e32 v7, s21, v7",
+    "v_add_nc_u32_e32 v7, s22, v7",
+    "v_add_nc_u32_e32 v7, s23, v7",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[4:7], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+BFE_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16, wave_size=32)
+
+
+def bfe_model(src, ctrl, *, signed, zero_on_width0=True, sign_extend_past_32=True):
+    """Independent Python model of RDNA2 s_bfe_u32 / s_bfe_i32."""
+    src &= 0xffffffff
+    offset = ctrl & 0x1f
+    width = (ctrl >> 16) & 0x7f
+    if width == 0:
+        return 0 if zero_on_width0 else src
+    if offset + width <= 32:
+        field = (src >> offset) & ((1 << width) - 1)
+        if signed and (field & (1 << (width - 1))):
+            field |= (~0 << width) & 0xffffffff
+        return field
+    field = src >> offset
+    if signed and sign_extend_past_32 and (src & 0x80000000):
+        field |= (~0 << (32 - offset)) & 0xffffffff
+    return field
+
+
+def bfe_words(*, signed_u32=False, signed_i32=True, zero_on_width0=True, sign_extend_past_32=True):
+    """Independent reference for one BFE group: 64 threads storing 4 words each."""
+    words = [SENTINEL] * 320
+    s4 = 0x8000f5a3
+    s5 = 0x00140014
+    s16 = bfe_model(s4, 0x00080008, signed=signed_u32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s17 = bfe_model(s4, 0x00080008, signed=signed_i32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s18 = bfe_model(s4, 0xff80ffe8, signed=signed_i32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s19 = bfe_model(s4, s5, signed=signed_u32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s20 = bfe_model(s4, s5, signed=signed_i32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s21 = bfe_model(0xffffffff, 0x00200000, signed=signed_i32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s22 = bfe_model(s20, 0xff80ffe0, signed=signed_u32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    s23 = bfe_model(s4, 0x00100010, signed=signed_u32, zero_on_width0=zero_on_width0, sign_extend_past_32=sign_extend_past_32)
+    for flat in range(64):
+        words[4 * flat + 0] = (s16 + flat) & 0xffffffff
+        words[4 * flat + 1] = (s17 + flat) & 0xffffffff
+        words[4 * flat + 2] = (s19 ^ s20 ^ flat) & 0xffffffff
+        words[4 * flat + 3] = (s18 + s21 + s22 + s23 + flat) & 0xffffffff
+    return words
+
+
+def bfe_controls():
+    """s_bfe_u32 / s_bfe_i32: exact HLSL, per-helper emission, and one refusal per unsupported form."""
+    hlsl = aot.lower(BFE, 64, **BFE_BINDING)
+    lines = hlsl.splitlines()
+    assert "uint s_bfe_u32(uint src, uint ctrl) {" in lines, lines
+    assert "uint s_bfe_i32(uint src, uint ctrl) {" in lines, lines
+    store_line = [line for line in lines if "outputData.Store4(" in line]
+    assert store_line == [
+        "    outputData.Store4(tid.x * 16u + 0u, uint4("
+        "(s_bfe_u32(0x8000f5a3u, 0x00080008u) + tid.x), "
+        "(s_bfe_i32(0x8000f5a3u, 0x00080008u) + tid.x), "
+        "(s_bfe_i32(0x8000f5a3u, 0x00140014u) ^ (s_bfe_u32(0x8000f5a3u, 0x00140014u) ^ tid.x)), "
+        "(s_bfe_u32(0x8000f5a3u, 0x00100010u) + (s_bfe_u32(s_bfe_i32(0x8000f5a3u, 0x00140014u), 0xff80ffe0u) + "
+        "(s_bfe_i32(0xffffffffu, 0x00200000u) + (s_bfe_i32(0x8000f5a3u, 0xff80ffe8u) + tid.x))))));"
+    ], store_line
+    # Helpers are emitted only when referenced.
+    only_u32 = aot.lower(variant(READ_SCALAR, ("s_lshr_b32 s21, s20, 3", "s_bfe_u32 s21, s20, 0x00080004")),
+                         32, **READ_BINDING)
+    assert "uint s_bfe_u32(" in only_u32 and "uint s_bfe_i32(" not in only_u32
+    only_i32 = aot.lower(variant(READ_SCALAR, ("s_lshr_b32 s21, s20, 3", "s_bfe_i32 s21, s20, 0x00080004")),
+                         32, **READ_BINDING)
+    assert "uint s_bfe_i32(" in only_i32 and "uint s_bfe_u32(" not in only_i32
+    # Refusals: unknown/pending sources, invalid destinations, unsupported spellings/modifiers, SCC/address/guard.
+    unsupported, operand = "Unsupported compute instruction: ", "Unverified scalar ALU operand"
+    for message, changes in (
+        (operand, (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32 s16, s30, 0x80008"),)),
+        (operand, (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32 s16, s4, s30"),)),
+        (operand, (("s_bfe_i32 s17, s4, 0x80008", "s_bfe_i32 s17, s12, 0x80008"),)),
+        (operand, (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32 s106, s4, 0x80008"),)),
+        (operand, (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32 s16, s4, 0x1ffffffff"),)),
+        (unsupported + "s_bfe_u64", (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u64 s[16:17], s[4:5], 0x80008"),)),
+        (unsupported + "s_bfe_i64", (("s_bfe_i32 s17, s4, 0x80008", "s_bfe_i64 s[16:17], s[4:5], 0x80008"),)),
+        (unsupported + "s_bfe_u32", (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32 s16, v0, 0x80008"),)),
+        (unsupported + "s_bfe_i32", (("s_bfe_i32 s17, s4, 0x80008", "s_bfe_i32 s17, s4, 1.0"),)),
+        (unsupported + "s_bfe_u32", (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32 s16, s4, exec_lo"),)),
+        (unsupported + "s_bfe_u32", (("s_bfe_u32 s16, s4, 0x80008", "s_bfe_u32_e64 s16, s4, 0x80008"),)),
+        (unsupported + "s_bfe_i32", (("s_bfe_i32 s17, s4, 0x80008", "s_bfe_i32 s17, s4, 0x80008 clamp"),)),
+        (unsupported + "s_bfe_i32", (("s_bfe_i32 s17, s4, 0x80008", "s_bfe_i32 s17, -s4, 0x80008"),)),
+        (unsupported + "s_bfe_i32", (("s_bfe_i32 s17, s4, 0x80008", "s_bfe_i32 s17, abs(s4), 0x80008"),)),
+        (unsupported + "s_cbranch_scc0 0", (("s_endpgm", "s_cbranch_scc0 0\ns_endpgm"),)),
+    ):
+        rejects(message, aot.lower, variant(BFE, *changes), 64, **BFE_BINDING)
+    # Pending constant load as source or destination.
+    pending_load = [
+        "s_mov_b32 s9, 0",
+        "s_load_dwordx4 s[12:15], s[8:9], null",
+        "s_load_dwordx4 s[16:19], s[8:9], 0x10",
+        "s_waitcnt lgkmcnt(0)",
+        "s_buffer_load_dword s23, s[16:19], 0x0",
+        "s_bfe_u32 s24, s23, 0x00080008",
+        "s_endpgm",
+    ]
+    rejects(operand, aot.lower, pending_load, 64, **(BFE_BINDING | dict(constant_descriptor=16)))
+    rejects(operand, aot.lower, variant(pending_load, ("s24, s23", "s23, s10")), 64,
+            **(BFE_BINDING | dict(constant_descriptor=16)))
+    # Result used as store address or guard compare, and expression limit.
+    rejects("Unsupported store address", aot.lower,
+            variant(READ_SCALAR, ("s_lshr_b32 s21, s20, 3", "s_bfe_u32 s21, s20, 0x00080004"),
+                    ("v1, v0, s[8:11]", "v1, v21, s[8:11]"),
+                    ("v_min_u32_e32 v1, s21, v1", "v_min_u32_e32 v1, s21, v1\nv_mov_b32_e32 v21, s21")),
+            32, **READ_BINDING)
+    rejects("Unverified lane guard compare", aot.lower,
+            variant(READ_SCALAR, ("s_lshr_b32 s21, s20, 3", "s_bfe_i32 s21, s20, 0x00080004"),
+                    ("v_min_u32_e32 v1, s21, v1", "v_min_u32_e32 v1, s21, v1\nv_cmp_gt_u32_e32 vcc_lo, s21, v1")),
+            32, **READ_BINDING)
+    rejects("ALU expression too large", aot.lower,
+            variant(BFE, ("s_bfe_u32 s16, s4, 0x80008",
+                          "s_bfe_u32 s16, s4, 0x80008" + "\ns_bfe_u32 s16, s16, s16" * 6)),
+            64, **BFE_BINDING)
+
+
+def bfe_binary(directory, assembler, objcopy, library):
+    """The assembled BFE program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, BFE), library, offsets=True))
+    assert [line for line in decoded if line.startswith("s_bfe_")] == [
+        line for line in BFE if line.startswith("s_bfe_")], decoded
+    assert aot.lower(decoded, 64, **BFE_BINDING) == aot.lower(BFE, 64, **BFE_BINDING)
+
+
+def bfe_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("bfe.hlsl", "bfe.cso", "bfe.case")]
+    source = aot.lower(BFE, 64, **BFE_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = bfe_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[256] ^= 1
+    for label, reference, word in (
+            ("s_bfe_i32 treated as unsigned", bfe_words(signed_i32=False), 1),
+            ("width 0 not returning 0", bfe_words(zero_on_width0=False), 3),
+            ("offset+width > 32 not sign-extending", bfe_words(sign_extend_past_32=False), 2),
+            ("sentinel past group", off, 256)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"bfe: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("width 0 returns src", source.replace("if (width == 0u) return 0u;", "if (width == 0u) return src;")),
+            ("s_bfe_i32 uses unsigned right shift", source.replace("asuint(asint(src) >> offset)", "(src >> offset)"))):
+        if mutated == source:
+            raise AssertionError(f"bfe: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"bfe: mutation '{label}' escaped detection")
     return 0
 
 
@@ -4725,6 +4911,7 @@ def binary(directory, assembler, objcopy, library):
     salu_i32_binary(directory, assembler, objcopy, library)
     mbcnt_binary(directory, assembler, objcopy, library)
     bcnt_exec_binary(directory, assembler, objcopy, library)
+    bfe_binary(directory, assembler, objcopy, library)
     vadd_nc_i32_binary(directory, assembler, objcopy, library)
     cvt_u32_f32_binary(directory, assembler, objcopy, library)
     ff1_exec_binary(directory, assembler, objcopy, library)
@@ -8046,6 +8233,7 @@ if __name__ == "__main__":
                  "draw-mbcnt": mbcnt_draw,
                  "draw-salu_i32": salu_i32_draw,
                  "draw-bcnt-exec": bcnt_exec_draw,
+                 "draw-bfe": bfe_draw,
                  "draw-vadd_nc_i32": vadd_nc_i32_draw,
                  "draw-ff1-exec": ff1_exec_draw,
                  "draw-ff1-scalar": ff1_scalar_draw,

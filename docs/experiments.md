@@ -113,7 +113,7 @@ ctest --preset dev --no-tests=error -R '^startup_r8_uint_(warp|hardware)$' -V
 
 ### Every vertex-fetch buffer format
 
-The `gfx2hlsl` table for `tbuffer_load_format_*` has ten formats: `BUF_FMT_8_UNORM`, `8_UINT`, `8_8_UNORM`, `16_16_UNORM`, `16_16_FLOAT`, `8_8_8_8_UNORM`, `32_FLOAT`, `32_32_FLOAT`, `32_32_32_FLOAT` and `32_32_32_32_FLOAT`. Before this check, only `8_UINT` and `8_UNORM` were run. `tests/startup_vertex_fetch_formats_check.py` runs all ten the way the check above does. It translates a source-built vertex stage with one `tbuffer_load_format_xyzw` from vertex-buffer slot 1, calls the generated vertex body from a compute wrapper, and reads back the four position components of 16 vertices. The expected words come from a reference that decodes the same bytes from the format definitions: little-endian fields from the lowest byte, UNORM `n / (2^bits - 1)`, binary16 widened to binary32, and missing X, Y and Z as 0 with a missing W as 1.0 (1 for `8_UINT`). It shares no code with the translator's table.
+The `gfx2hlsl` table for `tbuffer_load_format_*` has ten formats (plus `16_16_SNORM`, added afterwards and described at the end of this section): `BUF_FMT_8_UNORM`, `8_UINT`, `8_8_UNORM`, `16_16_UNORM`, `16_16_FLOAT`, `8_8_8_8_UNORM`, `32_FLOAT`, `32_32_FLOAT`, `32_32_32_FLOAT` and `32_32_32_32_FLOAT`. Before this check, only `8_UINT` and `8_UNORM` were run. `tests/startup_vertex_fetch_formats_check.py` runs all ten the way the check above does. It translates a source-built vertex stage with one `tbuffer_load_format_xyzw` from vertex-buffer slot 1, calls the generated vertex body from a compute wrapper, and reads back the four position components of 16 vertices. The expected words come from a reference that decodes the same bytes from the format definitions: little-endian fields from the lowest byte, UNORM `n / (2^bits - 1)`, binary16 widened to binary32, and missing X, Y and Z as 0 with a missing W as 1.0 (1 for `8_UINT`). It shares no code with the translator's table.
 
 - **Element alignment.** Formats with fields narrower than a dword use strides and offsets that put elements at more than one byte alignment (stride 3 offset 2, stride 5 offset 3, stride 6 offset 2, stride 10 offset 10), so fields that cross a dword go through `ldu()`. The 32-bit formats keep 4-byte aligned elements, which their aligned `Load()` needs.
 - **How components are compared.** UNORM components are compared as `round(v * (2^bits - 1))`, so the result does not depend on how many ulps the division is off. All other components are compared bit for bit. The chosen binary16 and binary32 values are all normal.
@@ -124,6 +124,8 @@ All ten formats matched on WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (dr
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_vertex_fetch_formats_(controls|warp|hardware)$' -V
 ```
+
+`BUF_FMT_16_16_SNORM` (format 24, DXGI `R16G16_SNORM` 37) sign-extends each half, divides by 32767 and clamps to -1.0, so -32768 and -32767 both give -1.0 (the Direct3D and Vulkan SNORM rule, as in LLVM 15 and Mesa `ac_formats`). The device run compares `round(v * 32767)` against the same byte decode, with a wrong reference that reads the halves unsigned and a mutated translation that does the same. The pattern the harness writes to t0 holds no 0x8000, so `startup_vertex_fetch_formats_controls` also evaluates the emitted expressions on 0x8000, 0x8001, 0x7fff, 0x0000, 0xffff and 0x4000 in each half, and four wrong forms (unsigned read, no clamp, divisor 32768, one half for both) must fail that check. The D3D12 draw has not been run on Linux.
 
 ### Combined `idxen` + `offen`, scalar `soffset` and MUBUF/MTBUF modifier checks
 
@@ -3693,6 +3695,37 @@ python3 -B tests/compute_mimg_image_uav_load_check.py
 python3 -B tests/compute_mimg_image_uav_load_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
 ```
 
+### gfx1013 2D D16 float image stores
+
+Declare `--image-format R16G16B16A16_FLOAT` and `--image-uav-mip 0`
+for a gfx1013 2D `image_store d16` with DMASK `0xf`. The store
+uses two full-width address VGPRs for X and Y and two data VGPRs.
+The low and high halves of VDATA supply R and G. The low and high halves
+of VDATA+1 supply B and A. The translator widens the four halves with
+`f16tof32` and writes to `RWTexture2D<float4>` at `u0`. Bind an
+`R16G16B16A16_FLOAT` UAV so the typed store narrows to binary16.
+RDNA 2 ISA §§8.2.1 and 8.2.5 describe packed D16 data. LLVM 15 accepts
+two data VGPRs for a full mask and rejects other counts.
+[AMD RDNA 2 ISA](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content)
+
+The fixture writes 16 unique texels in mip zero. The CPU reference compares
+1,344 raw halves across three mips, including 1,280 sentinels. The written
+halves cover positive and negative normals, subnormals of both signs, and both
+signed zeros. Swapping the halves of VDATA changes 32 comparisons, and swapping
+the two data VGPRs changes 64. Sparse masks, D16 loads, atomics, A16, non-2D
+dimensions and gfx1030 are refused. The fixture covers finite binary16 values
+on desktop D3D12. NaN payloads and infinities are outside the measurement.
+
+```powershell
+cmake --build --preset dev --target offscreen_check -j 2
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_gfx1013_image_store_d16_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/compute_mimg_float_store_d16_check.py
+python3 -B tests/compute_mimg_float_store_d16_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
+```
+
 ### gfx1013 2D image atomics
 
 The gfx1013 profile accepts `image_atomic_add`, `image_atomic_umax` and
@@ -5001,6 +5034,14 @@ The CPU controls reject a missing or wrong restore, a saved mask overwritten und
 
 `shader_profile_audit.py` is unchanged. It does not bind b0, so it does not try guards that read their bound from a constant, and it does not label branches.
 
+#### Integer inequality lane guards
+
+`v_cmp_ne_i32_e32 vcc_lo, src0, vSrc1` and the `_e64` form writing `vcc_lo` can feed the `s_and_saveexec_b32` guard above. Source 0 is an integer immediate or a resolved SGPR or VGPR; the `_e32` source 1 is a VGPR, and the `_e64` source 1 may also be an SGPR or an integer immediate. Operands follow the existing guard's rules for resolved words, so a word read or computed in the program is still refused. The guard emits `!=` on the 32-bit words, which is the same for signed and unsigned operands. The unsigned ordered compares now share the same operand parser. `v_cmpx`, other destinations and source modifiers stay refused. The control checks both encodings, the refusals, and a mutation that turns the predicate into equality.
+
+```sh
+python -B tests/compute_alu_cmp_ne_check.py
+```
+
 ### Lane-pattern masks from s_bitreplicate_b64_b32
 
 `s_bitreplicate_b64_b32 s[d:d+1], imm` copies each source bit into two adjacent destination bits: for i in 0..31, `D.u64[2i] = D.u64[2i+1] = S0.u32[i]`, so `0x0f0f` becomes `0x00ff00ff` and `0x3f3f3f3f` becomes `0x0fff0fff0fff0fff`. The store profile folds it when the source is an integer inline constant or a 32-bit literal. Both halves become known words: the low one replicates bits 0-15 and the high one bits 16-31. They can be copied or used by the scalar and vector ALU forms like any other known word. The destination must be an even-aligned pair at or below s105 that is not waiting for a load. An SGPR, VGPR or float source is refused with `Unverified lane mask source`, even an SGPR that holds a known word.
@@ -5226,6 +5267,14 @@ The LLVM 15 round trip assembles and disassembles the fixture as for the other f
 
 Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_bcnt_exec_(warp|hardware)$' -V`.
 
+#### Scalar pair population count
+
+`s_bcnt1_i32_b64 sD, s[lo:hi]` writes the number of set bits in both words of an even-aligned, consecutive SGPR pair to `sD`. With two known words the count is folded; with runtime words the translator emits `countbits(lo) + countbits(hi)`. Both words are read before `sD` is written, so `sD` may alias either half of the pair. The instruction sets `SCC` to `sD != 0`; this profile has no `SCC` reader, and a following `s_cbranch_scc*` stays refused. Unaligned or out-of-range pairs, pending destinations and unverified source words are refused. The control covers zero, 64 set bits, aliasing, a runtime word, the refusals, and a mutation that drops the high word.
+
+```sh
+python -B tests/compute_alu_bcnt64_check.py
+```
+
 #### First active lane of a full wave
 
 `s_ff1_i32_b64 sD, exec` and `s_ff1_i32_b32 sD, exec_lo` return the index of the lowest set bit of `exec` (64-bit) or `exec_lo` (32-bit) in the single 32-bit SGPR `sD`, preserving `SCC`. Outside a guarded region, lane 0 of every wave is active for any group of at least 1 thread (and for wave32 the high half of `exec` is 0), so both forms fold to the known scalar word `0`. Uses inside a guarded region (`s_and_saveexec_b32` through `exec` restore), any other exec-mask source (`vcc`, `exec_hi`, or the wrong width), a literal, an SGPR that does not hold a known data word, and invalid or pending destinations (`s106`, `s12`, or an SGPR pair) are refused. A tracked general SGPR is a separate case below and is not folded to the active lane.
@@ -5272,6 +5321,12 @@ The store profile also accepts these scalar 32-bit operations. Both sources are 
 The result becomes an inline HLSL expression, like a vector result, and a vector instruction can read it as a source. SCC is not modelled: no accepted instruction reads it. A destination past s105, a destination or source that waits for a load, a source that is not a known word (an unwritten SGPR, a descriptor, the saved exec mask), a vector source and the carry-in, signed, 64-bit and inverted forms stop the lowering, as does an expression over 1024 characters. A scalar result is data only: it cannot form an address or be a lane-guard compare operand. Overwriting the saved exec mask is rejected at the guard restore.
 
 The check assembles one fixture that chains all six operations over the cap word and the bound, and requires the decoded program to lower to the same HLSL as its text.
+
+#### Scalar bit-field extract
+
+`s_bfe_u32 sD, S0, S1` and `s_bfe_i32 sD, S0, S1` (SOP2) extract a `S1[22:16]`-bit field starting at `S1[4:0]` from a known 32-bit scalar word `S0`, zero- or sign-extending to 32 bits (`0` when `S1[22:16] == 0`, and `S0 >> S1[4:0]` when `S1[4:0] + S1[22:16] > 32`). `SCC` is written (`D != 0`) but unread in this subset. Both lower to explicit HLSL helpers (`s_bfe_u32` and `s_bfe_i32`) emitted only when referenced, so a width of `0` returns `0` rather than shifting by `32`, and every shift count stays in `0..31`.
+
+The `BFE` fixture in `tests/compute_store_check.py` is source-built in LLVM 15 spelling for one 64-thread group (`wave_size=32`, 4 words per thread, 256 words written and words `256..319` left at `SENTINEL`). It exercises `s_bfe_u32` and `s_bfe_i32` on a mid-word field with MSB 1 (`0x8000f5a3`, offset 8, width 8), width 0 with ignored bits set in `S1[31:23]` and `S1[15:5]` (`0xff80ffe8` and `0xff80ffe0`), `offset + width == 32` (`0x00100010`), `offset + width > 32` (`0x00140014`), an inline negative constant (`-1`, offset 0, width 32), and a chained `s_bfe` source. All 320 words are compared against an independent Python model of the ISA pseudocode. Reference controls must fail for: `s_bfe_i32` treated as unsigned (word 1), width 0 not returning 0 (word 3), `offset + width > 32` not sign-extending (word 2), and a changed sentinel past the group (word 256). Recompiled-HLSL mutations must fail on the device for: `width == 0u` returning `src` instead of `0u`, and `s_bfe_i32` using unsigned right shift. `bfe_controls()` checks exact HLSL emission (including per-helper emission), all scalar source/destination refusals, 64-bit forms, modifier/vector/float spellings, SCC consumers, address/guard uses, and expression-limit refusal. `bfe_binary()` verifies the LLVM 15 round trip. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_bfe_(warp|hardware)$' -V`.
 
 #### Scalar absolute difference
 
@@ -6293,6 +6348,16 @@ quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal and +inf. The ma
 operand (the census form uses the inline `-1`, i.e. every class) and the value as a float; the `_e32` and
 `_e64` spellings share the path, and the `v_cmpx_` form writes EXEC and clears the straight-line assumption.
 Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cmp_class$' -V`.
+
+**The startup binary16 class comparison.** The e32 and e64 forms classify the
+low 16 raw bits of SRC0 and compare the resulting class bit against integer
+SRC1. The e64 source modifiers change the half's sign bit. The literal
+`0x7c01` reaches the helper unchanged. The EXEC-writing form intersects the
+new predicate with a previously narrowed EXEC. SDWA and ambiguous signed
+inline source spellings remain refused in this path. The fixture checks all
+65,536 inputs against an independent binary16 classification and runs decoded
+source-word and refusal controls. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cmp_class_f16$' -V`.
 
 **An `op_sel` the lowering does not model is refused.** `set_vf()` used to accept an `op_sel` modifier and emit
 the same text as without it. `op_sel` selects which half of a packed source the operation reads, so dropping
@@ -11622,6 +11687,16 @@ Tests: `startup_gfx2hlsl_cvt_alu_controls`, `startup_gfx2hlsl_cvt_alu_warp` and 
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_int_med3_controls$' -V
 ```
 
+## Startup translator: lane-mask marks after a scalar overwrite
+
+`tools/startup/gfx2hlsl.py` records the SGPRs that hold a lane mask (a `v_cmp` destination, a saveexec copy) in `Stage.masks`, and lowers a scalar logic op with a mask source as a mask op whose result is the lane's bit. The generic scalar path cleared the mark when it wrote ordinary data into such a register, but the other scalar writers did not. After `v_cmp_eq_u32_e64 s6, v0, v1` and `s_buffer_load_dword s6, s[16:19], 0x0`, s6 holds a buffer word, yet `s_or_b32 s8, s6, s7` was lowered as `s8 = (s6 | s7) & 1;`. Every write through `set_s` now clears the mark, the writers of a mask mark the register again after the write, and `s_load` clears the mark on its destination registers, also in the forms that only record a descriptor symbol.
+
+`tests/startup_gfx2hlsl_mask_overwrite_check.py` writes a mask with a compare, overwrites it with an `s_buffer_load`, an `s_load` through a root pointer, an `s_load` of a descriptor or an `s_cselect_b32`, and evaluates the following `s_or_b32` on a buffer word with the restricted evaluator of `startup_gfx2hlsl_bit_alu_check.py`. Controls: without the overwrite the OR stays a mask OR, and a compare or a mask logic op after a load marks the register again. On the translator before this change seven checks fail (the mark stays and the OR is cut to bit 0). Test: `startup_gfx2hlsl_mask_overwrite_controls`. Not covered: a draw through a translated pipeline; the other symbol-only scalar writes (for example an `s_mov` of a descriptor) still keep a mark they find.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mask_overwrite_controls$' -V
+```
+
 ## Startup translator: explicit-LOD image sampling
 
 `tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
@@ -11712,7 +11787,7 @@ lane masks and the discard destination. Run
 
 `tools/startup/gfx2hlsl.py` now lowers six gfx1013 per-lane bit operations that it used to refuse: `v_bfe_i32`, `v_bcnt_u32_b32`, `v_ffbl_b32`, `v_ffbh_u32`, `v_ffbh_i32` and `v_bfrev_b32`. They become single HLSL expressions, so no helper function is added to the output: `countbits(a) + b`, `firstbitlow(a)`, `reversebits(a)`, and, for the two high scans, `a == 0u ? 0xffffffffu : 31u - firstbithigh(a)` (the signed form scans `~a` for a negative value and reads 0xffffffff for 0 and -1). `v_bfe_i32` takes the offset from bits 4:0 of source 1 and the width from bits 4:0 of source 2, reads 0 for a width of 0, and sign-extends the field from its top bit; when offset plus width passes 32, the bits above bit 31 repeat bit 31, which is an arithmetic shift of the whole word. The formulas and edge cases are the ones `tools/pixel_aot.py` already draws on WARP. `v_bfe_i32` and `v_bcnt_u32_b32` exist only as VOP3 on gfx1013 (llvm-mc 19 rejects `_e32`); the other four assemble in both `_e32` and `_e64`. Source modifiers, `clamp`, output modifiers, `op_sel` and a wrong operand count are refused with `Unsupported`; the operand count is now checked for every integer operation in this table, where a missing operand used to raise `IndexError`. Not lowered here: the 64-bit carry forms, `v_bfm_b32`, the 24-bit multiplies and `v_alignbit_b32`.
 
-`tests/startup_gfx2hlsl_bit_alu_check.py` translates a source-built pixel stage that applies each operation to four lanes (the VOP1 operations alternate `_e32` and `_e64`) and evaluates the generated text with a small 32-bit HLSL evaluator against a reference written from the ISA description with bit loops, string reversal and integer arithmetic. The grid holds 17,459 inputs for `v_bfe_i32` (every offset and width 0 to 31 for 17 base words, plus offsets and widths above 31), 324 for `v_bcnt_u32_b32` and 81 for each scan. Each lowering also has a mutation that must read a wrong word: no sign extension, a subtracted addend, 0 instead of 0xffffffff for zero, no `31u -`, a negative value scanned unchanged, and no bit reversal. On `origin/main` the check fails with `Unsupported: v_bfe_i32`. `binary <llvm-mc>` reassembles the fixtures (llvm-mc 19 here; the CI job passes llvm-mc 15). The `draw` mode compiles the translated pair with FXC and DXC and draws one pixel per four input sets through `offscreen_check --startup-flat-param`; the inputs travel as flat vertex parameters so the compilers cannot fold them. It also draws the first set of each operation with the mutated lowering and requires the mutated words in the readback. The evaluator and reference results above come from Linux. The draw mode passed at `48d9571d` on Windows 11 build 26300.9974 with DXC 1.8.2502.11 and the Windows SDK 10.0.26100 FXC, with the debug layer on and 0 errors and 0 warnings. It passed on WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003). On each adapter, all 34 draws (17 through FXC `ps_5_1` and 17 through DXC `ps_6_0`) matched the reference words, and all 12 mutated draws read their mutated words. Tests: `startup_gfx2hlsl_bit_alu_controls`, `startup_gfx2hlsl_bit_alu_warp` and `startup_gfx2hlsl_bit_alu_hardware`. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+`tests/startup_gfx2hlsl_bit_alu_check.py` translates a source-built pixel stage that applies each operation to four lanes (the VOP1 operations alternate `_e32` and `_e64`) and evaluates the generated text with a small 32-bit HLSL evaluator against a reference written from the ISA description with bit loops, string reversal and integer arithmetic. The grid holds 17,459 inputs for `v_bfe_i32` (every offset and width 0 to 31 for 17 base words, plus offsets and widths above 31), 324 for `v_bcnt_u32_b32` and 81 for each scan. Each lowering also has a mutation that must read a wrong word: no sign extension, a subtracted addend, 0 instead of 0xffffffff for zero, no `31u -`, a negative value scanned unchanged, and no bit reversal. On `origin/main` the check fails with `Unsupported: v_bfe_i32`. `binary <llvm-mc>` reassembles the fixtures (llvm-mc 19 here; the CI job passes llvm-mc 15). The `draw` mode compiles the translated pair with FXC and DXC and draws one pixel per four input sets through `offscreen_check --startup-flat-param`; the inputs travel as flat vertex parameters so the compilers cannot fold them. It also draws the first set of each operation with the mutated lowering and requires the mutated words in the readback. The evaluator and reference results above come from Linux. The draw mode passed at `48d9571d` on Windows 11 build 26300.9974 with DXC 1.8.2502.11 and the Windows SDK 10.0.26100 FXC, with the debug layer on and 0 errors and 0 warnings. It passed on WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003). On each adapter, all 34 draws (17 through FXC `ps_5_1` and 17 through DXC `ps_6_0`) matched the reference words, and all 12 mutated draws read their mutated words. Tests: `startup_gfx2hlsl_bit_alu_controls`, `startup_gfx2hlsl_bit_alu_warp` and `startup_gfx2hlsl_bit_alu_hardware`. [AMD RDNA 2 ISA reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture) `v_xor3_b32` (`D = S0 ^ S1 ^ S2`, the LLVM 15 and RDNA 2 definition, as in the compute lowering of #1573) joins the same check with 729 grid inputs and three draw sets whose three sources differ in every byte (0x13579bdf, 0x2468ace0, 0xfedcba98 and their rotations); its mutation drops the third operand and reads `src0 ^ src1`. Source modifiers, `clamp`, `op_sel` and a wrong operand count stay refused. `binary` matches the xor3 words with llvm-mc 23; the draw has not run on Windows for it yet.
 
 The binary32 table (`VEC_F`) applies the same operand-count rule. Before this change, a form one source short (`v_add_f32 v1, v2`) raised `IndexError` in `Stage.one` instead of `Unsupported`. A form with one source too many (`v_med3_f32 v1, v2, v3, v4, v5`) translated with the extra source dropped. `tests/startup_gfx2hlsl_operand_count_check.py` (`startup_gfx2hlsl_operand_count`) checks every operation of both tables: one source fewer and one source more are refused, and the exact count translates. It also checks that the constant and accumulator forms (`v_fmac_f32`, `v_mac_f32`, `v_fmamk_f32`, `v_fmaak_f32`, `v_madmk_f32`, `v_madak_f32`) keep translating with their usual operands. As a control, it loads the translator with the new `VEC_F` guard removed and requires both old failures to come back.
 

@@ -307,8 +307,18 @@ def sample_offset_arg(reg, vector, sample_dest, known_ssa_bits):
     return f", int2({x}, {y})"
 
 
-def comparison_sampler_state(words):
+# Word 2 bits 28-30 (value >> 28): MIP_POINT_PRECLAMP, ANISO_OVERRIDE, BLEND_ZERO_PRT. At an explicit level zero
+# with anisotropy refused and no partially resident texture, none of them changes the result.
+LEVEL_ZERO_IGNORED_W2 = 0x7
+
+
+def comparison_sampler_state(words, level_zero=False):
     """Decode the sampler descriptor fields that change an image_sample_c_lz result on a 2D texture.
+
+    level_zero=True is for a caller that samples explicitly at level zero (the startup translator's c_lz form):
+    word 2 bits 28-30 are then accepted, because MIP_POINT_PRECLAMP only acts on mip selection, ANISO_OVERRIDE
+    only on anisotropic filtering (refused above) and BLEND_ZERO_PRT only on partially resident textures.
+    Bit 31 stays refused. The default keeps the strict check the pixel AOT path is verified against.
 
     Field positions are those of SQ_IMG_SAMP_WORD0..3 (registers 0x8F30..0x8F3C in Mesa
     src/amd/registers/gfx10-rsrc.json; enum values in the Linux navi10_enum.h). Not read, because the accepted profile makes them irrelevant: CLAMP_Z,
@@ -344,7 +354,7 @@ def comparison_sampler_state(words):
     mag, minify, mip = (w2 >> 20) & 3, (w2 >> 22) & 3, (w2 >> 26) & 3
     if mag != minify or mag not in COMPARISON_FILTERS:
         raise ValueError("Comparison sampling requires one point or bilinear XY filter")
-    if mip == 3 or w2 >> 28:
+    if mip == 3 or (w2 >> 28) & ~(LEVEL_ZERO_IGNORED_W2 if level_zero else 0):
         raise ValueError("Unsupported mip filter or word 2 bits 28-31")
     if (w3 >> 12) & 0x3ffff:
         raise ValueError("Comparison sampling with word 3 bits 12-29 (UPGRADED_DEPTH on GFX8) is not supported")
