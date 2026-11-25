@@ -1152,6 +1152,14 @@ Slot 21 reserves the caller's async block on that same XAsync service, with its 
 
 `ctest --preset dev --no-tests=error -R '^startup_gamesave_read_async_'` commits two blobs in one process and reads them in a second through slots 21 and 22. It checks the completion callback, the required size, the count and the exact bytes, a missing blob, a short buffer that leaves the output unchanged, and two overlapping reads. The controlled fixture always runs. The system variant uses an immediate Windows gaming runtime queue and skips only when that runtime is unavailable. `ctest --preset dev --no-tests=error -R '^startup_save_blob_pack'` checks `src/startup_stubs/save_blob_pack.h` directly without a runtime or disk store, including layout, `uint32_t` payload-size and `size_t` overflow refusals, and a negative control for the earlier size check.
 
+### Completion on a manual queue
+
+A completed XAsync operation can sit unconsumed when its block names a queue whose completion port is manual and nobody dispatches that port. `tests/startup_async_manual_completion.cpp` separates this from an operation that is still pending. It starts one synthetic operation on a queue whose work and completion ports are both manual. The provider completes it with an 8-byte payload on another thread. The test then prints four observations for each phase: the Begin return, the non-waiting `XAsyncGetStatus`, `XAsyncGetResultSize` and the callback count with what the callback retrieved. The phases are before completion (`pending`), after completion and one work-port dispatch (`unpumped`), and after one completion-port dispatch (`dispatched`). The callback count must be 0 until the completion port is dispatched. One dispatch must then run exactly one callback that retrieves the payload, and a second dispatch must find no work. A second block on an immediate queue is the contrast: its callback runs at completion with no dispatch. The `system` variant uses the installed Windows gaming runtime's XAsync service (`073b7dcb`) and prints its status and result-size answers without asserting them. It reports a capability skip (77) when that runtime or the queue is unavailable. The `controlled` variant uses a stand-in service in the test. In `inline_control` that stand-in runs the callback inside `XAsyncComplete`, as an immediate port would, and the control must print `FAIL: callback ran before the completion port was dispatched`. [XAsyncGetStatus](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasyncgetstatus) · [XTaskQueueDispatch](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuedispatch)
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_async_manual_completion_(controlled|system|inline_control)$' -V
+```
+
 ## Findings
 
 These are measured on one executable; treat them as hypotheses for others.
