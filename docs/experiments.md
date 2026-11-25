@@ -1,5 +1,27 @@
 # Experiment notes and reproduction commands
 
+## D3D12 budget accounting
+
+`startup_resource_budget` creates placed buffers on a shared heap, a placed
+texture, committed textures and buffers, a readback buffer, and two slot 148
+allocations that fit on one upload page. It also exercises the committed
+backing from slot 133 and, when existing heaps are supported, two slot 133
+buffers placed over the same mapped allocation. The test compares exact
+desktop allocation sizes, checks each live category against its initial
+snapshot after release, and checks retained backing separately. The inline
+control omits one release before the snapshot and must identify the committed
+buffer category.
+
+```powershell
+cmake --build --preset release --target startup_resource_budget -j 2
+ctest --preset release --no-tests=error -j 1 -R '^startup_resource_budget_' -V
+```
+
+The test runs on WARP and hardware with the debug layer on and off. The
+[budget heartbeat](startup-runtime.md#d3d12-resource-budget) correlates these
+counts with DXGI usage. The fixture measures the accounting and retirement
+paths using source-built allocations.
+
 ## Present color producer trace
 
 Set `X2W_RED_PRODUCER_AUTO=3700,12` and `X2W_PRESENT_SIGNATURE_EVERY=1` to sample the

@@ -1143,6 +1143,22 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
 endforeach()
 
+add_executable(startup_resource_budget tests/startup_resource_budget.cpp)
+target_include_directories(startup_resource_budget PRIVATE src)
+target_compile_features(startup_resource_budget PRIVATE cxx_std_17)
+target_link_libraries(startup_resource_budget PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(debug IN ITEMS 0 1)
+        set(case startup_resource_budget_${backend}_debug${debug})
+        set(budget_env "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=${debug}")
+        add_test(NAME ${case} COMMAND startup_resource_budget ${backend})
+        add_test(NAME ${case}_inline_control COMMAND startup_resource_budget ${backend} inline-control)
+        set_tests_properties(${case} ${case}_inline_control PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "${budget_env}")
+        set_tests_properties(${case}_inline_control PROPERTIES
+            PASS_REGULAR_EXPRESSION "FAIL: inline-control missed Release left buffer above baseline")
+    endforeach()
+endforeach()
+
 # GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
 add_executable(startup_indirect_dispatch tests/startup_indirect_dispatch.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_indirect_dispatch PRIVATE cxx_std_17)
