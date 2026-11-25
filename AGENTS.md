@@ -165,10 +165,13 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_arity_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_table_arity_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mad_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_neg_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compute_check.py
+./out/pe-env/bin/python -B tests/startup_compute_image_store_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_image_store_d16_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_translate_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_swap_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_fma_mix_check.py
 ./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_a16_check.py
 ./out/pe-env/bin/python -B tests/startup_image_load_d16_check.py
@@ -231,6 +234,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_image_gather_lz_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_c_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_alu_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_off_f32_i4_check.py
 ./out/pe-env/bin/python -B tests/startup_triage_run_check.py
 ./out/pe-env/bin/python -B tests/startup_run_ps1_check.py
 ./out/pe-env/bin/python -B tests/startup_run_sh_check.py
