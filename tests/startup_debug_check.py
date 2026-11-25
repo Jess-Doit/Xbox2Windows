@@ -157,7 +157,7 @@ def main(probe, calls_dll):
         # Log two out of 19 calls, even with the usual file hooks off. RDX changes each call,
         # RCX points into a known array, and R8 - 1 is the unreadable null address.
         entry = f"{log_rva:#x}@2:rdx;[rcx+8];[rcx-8];[r8-1]"
-        malformed = ("xyz", f"{log_rva:x}@0", f"{log_rva:x}:rdx;[rcx*8]", f"{log_rva:x}:rip")
+        malformed = ("xyz", f"{log_rva:x}@0", f"{log_rva:x}:rdx;[rcx*8]", f"{log_rva:x}:rip", f"{log_rva:x}:rdx;rdx")
         unusable = (0xffffffff, 0, sites[0])
         out, logdir = run(probe, work, "log-at",
                           {"X2W_LOG_AT": ",".join((*malformed, entry, *(f"{rva:x}:rax" for rva in unusable), entry))},

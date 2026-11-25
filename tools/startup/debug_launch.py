@@ -76,6 +76,8 @@ def parse_log_at(value, log):
             fields = []
             for item in items.split(";") if colon else LOG_REGS:
                 item = item.strip()
+                if any(item == field[0] for field in fields):
+                    raise ValueError(f"duplicate item {item!r}")
                 if item in LOG_REGS:
                     fields.append((item, LOG_REGS[item], None))
                     continue
