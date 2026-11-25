@@ -5523,6 +5523,47 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_subword_' -V
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### gfx1013 32-bit MUBUF buffer atomics
+
+The raw UAV profile lowers one unguarded `buffer_atomic_add`,
+`buffer_atomic_umax` or `buffer_atomic_cmpswap` through `u0` on gfx1013.
+Use `off` for a shared DWORD, `offen` with a verified shifted dispatch ID,
+or `idxen` with a verified dispatch ID and the declared byte stride.
+The descriptor must be ready at `lgkmcnt(0)`. Supply a linear, aligned raw
+UAV without thread-ID addition. The caller guarantees in-range addresses
+without wrap and a dispatch of one group on unused axes.
+
+`glc` places the old DWORD into the first data VGPR, available after
+`s_waitcnt vmcnt(0)`. Compare-swap reads replacement from VDATA and
+compare from VDATA+1, then passes compare before replacement to HLSL.
+VDATA+1 still holds the comparison word after the wait.
+[AMD RDNA 2 Shader ISA, MUBUF opcode 49](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+The result can be written by a later plain DWORD store. Use disjoint
+fields of the same per-lane address layout, or put every return record
+above the fixed shared word. Without `glc`, the profile accepts an
+unused data VGPR and requires an explicit rewrite before consuming
+that register. It refuses `_x2`, other atomic operations, a source
+SRV used as an atomic destination, and indexed plus offset addressing.
+
+The fixtures compare all 320 UAV words per dispatch. They cover separate
+add and unsigned max destinations, max without `glc`, compare-swap hits
+and misses, and 32 lanes adding different operands into one shared DWORD.
+The shared trace pairs each lane's returned DWORD with its operand and
+reconstructs every transition from the initial value to the exact total.
+Untouched words retain their patterned sentinels. Replacing add with OR
+and replacing the old-value record with the addend each change the readback.
+
+```powershell
+cmake --build --preset dev --target offscreen_check -j 2
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_gfx1013_buffer_atomics_(warp|hardware)$' -V
+```
+
+```sh
+python3 -B tests/compute_buffer_atomics_check.py
+python3 -B tests/compute_buffer_atomics_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
+```
+
 ### gfx1030 fixed-address MUBUF atomic reductions
 
 The compute store profile lowers one non-returning 32-bit MUBUF atomic
