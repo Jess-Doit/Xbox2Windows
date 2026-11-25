@@ -477,6 +477,16 @@ with the last refusal:
   existing four memory-SRV lines). Refusals without a resolved translated pipeline (`shader_key == 0`)
   are not counted in this census (matching the per-call log gate), so `total` counts only refusals
   attributed to a resolved translated shader key rather than all `ExecuteIndirect` refusals.
+- [`d3d12_xs_device.cpp`](../src/startup_stubs/d3d12_xs_device.cpp) also wires an `indirect-other`
+  census instance into `list_execute_indirect`: every `ExecuteIndirect` pre-check refusal counted under
+  `other` records `(key, reason_code)` (using the bound pipeline's known shader key when available, or
+  `0000000000000000` when no console pipeline key is resolved), distinguishes render-target and state
+  checks (`no_render_target`, `multiple_render_targets`, `depth_target_bound`,
+  `missing_viewport_or_scissor`, `target_format_mismatch`, `graphics_multi_command`,
+  `argument_outside_placed_buffer`, etc.), keeps logging the first occurrence of each of the first 8
+  distinct `(key, reason)` pairs even after the 16-call global refusal log limit is spent, emits deltas
+  in the five-second report, and appends the full `x2w-d3d12 indirect-other refusals:` lines to
+  `x2w_d3d12_census_report` whenever at least one `other` refusal occurred.
 
 Check without a device via
 `ctest --preset dev --no-tests=error -R '^startup_per_reason_refusal_census(_keep-(last|first)_control)?$' -V`:
@@ -486,12 +496,18 @@ reports; the `keep-last` and `keep-first` controls compile `PerReasonRefusalCens
 mismatch output, and are marked `WILL_FAIL`.
 
 Check the runtime wiring on WARP and hardware via
-`ctest --preset dev --no-tests=error -R '^startup_indirect_translated_refusal_census_(warp|hardware|control_warp)$' -V`:
-the pass runs interleave `missing_guest_root` and `sampled_texture_mismatch` on one translated pipeline
+`ctest --preset dev --no-tests=error -R '^startup_indirect_(translated|other)_refusal_census_(warp|hardware|control_warp)$' -V`:
+the `translated` pass runs interleave `missing_guest_root` and `sampled_texture_mismatch` on one translated pipeline
 key alongside `unsupported_resource_or_entry` and `incomplete_table_buffer` on two other keys plus a
 succeeding draw, then verify both `x2w_d3d12_census_report` (6 refusals, 3 keys, 4 pairs, 0 overflow)
-and both per-call log lines for the shared key; the control replaces the second refusal on key 1 with a
+and both per-call log lines for the shared key; its control replaces the second refusal on key 1 with a
 valid draw and must report the real counts (`total 5; distinct keys 3, distinct pairs 3`) as a mismatch.
+The `other` pass runs warm up one translated pipeline key, interleave `missing_viewport_or_scissor` and
+`argument_outside_placed_buffer` on that key alongside `graphics_multi_command` on key `0` (plus
+non-`other` placeholder, graphics-pipeline and compute-pipeline refusals that must not be counted), and
+verify `x2w_d3d12_census_report` (4 refusals, 2 keys, 3 pairs, 0 overflow, no `indirect-draw` lines)
+and the three per-call log lines; its control replaces the second refusal on key 1 with a valid draw and
+must report `total 3; distinct keys 2, distinct pairs 2` as a mismatch.
 
 ## Root constant buffer views
 
@@ -996,6 +1012,13 @@ text is grouped as `other (text omitted)` and never copied; raw snippets stay in
 `aliased` or `not aliased` field. Those lines are not counted as unhandled; they are counted by
 outcome (`aliased`, `not_aliased`, `failed`) in a separate table, and a line with an HRESULT other than 0
 (or an uncommitted address) still counts as `failed` and as an unhandled `Device::slot133` event.
+
+The `ExecuteIndirect` table reports the highest sampled cumulative count for each outcome and
+command-signature kind in the `x2w-render indirect:` census. A repeated snapshot does not increase
+any count. Each cell can come from a different sample, so avoid summing the cells as one run's total
+when scanning multiple runs. The section appears only after a complete census line and can show zero
+forwarded `dispatchmesh` calls alongside a graphics-pipeline refusal count. Forwarded counts describe
+the runtime's forwarding path. GPU completion and image readback require separate evidence.
 
 The `Run End-Point` section says how far a run got and how it ended, so that reports of runs with different
 memory caps can be told apart. It gives the largest `commit peak=` value of the `x2w-dstorage heartbeat` lines (not
@@ -2169,12 +2192,14 @@ These are measured on one executable; treat them as hypotheses for others.
   negative denormal. Uncompressed exports to `R8G8B8A8_UINT` and `R8G8B8A8_SINT` use unsigned
   and signed integer shader outputs. The output merger clamps each channel to 0–255 or −128–127
   respectively. With export words `ffffffff ffffff7f 00000080 00000100`, the stored bytes are
-  `ff ff 80 ff` for UINT and `ff 80 7f 7f` for SINT. The other 8- and 16-bit integer views
-  still return `unverified UINT/SINT RTV format <n>`.
+  `ff ff 80 ff` for UINT and `ff 80 7f 7f` for SINT. The same conversion applies to one or two
+  8-bit channels and one, two or four 16-bit channels. An uncompressed UINT export to
+  `R10G10B10A2_UINT` clamps RGB to 0–1023 and alpha to 0–3 before storage. Three-channel
+  `R32G32B32_UINT` and `R32G32B32_SINT` views still require readback verification.
   Uncompressed binary32 FLOAT outputs bitcast the export words after XOR with a private
   zero-valued entry constant so optimized FXC keeps denormal bit patterns. UNORM outputs still
-  undergo float-to-UNORM conversion. Packed integer exports and other integer formats remain
-  unsupported by this path.
+  undergo float-to-UNORM conversion. Compressed gfx1013 integer exports remain unsupported,
+  including when the destination is `R10G10B10A2_UINT`.
 - A colour export that leaves channels `off` does not write them, so the target keeps what it held
   there (#1674). `gfx2hlsl.py` records the written channels per target and writes
   `wmask <target> 0x<mask>` to the manifest when an export leaves any channel unwritten. The draw
