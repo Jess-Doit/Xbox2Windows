@@ -448,11 +448,7 @@ def main():
                     requested = "unreadable" if base is None else hex(base)
                     stack_args = struct.unpack("<2Q", (read(rsp + 0x28, 16) or b"").ljust(16, b"\0"))
                     kind, protect = (regs["R9"], stack_args[0]) if extended else stack_args
-                    stack = read(rsp, 8 * 200)
-                    if not stack:
-                        # A short stack can end before the full scan. Retry within RSP's page.
-                        stack = read(rsp, min(8 * 200, 0x1000 - (rsp & 0xfff)))
-                    words = struct.unpack_from("<200Q", stack.ljust(8 * 200, b"\0"))
+                    words = struct.unpack_from("<200Q", (read(rsp, 8 * 200) or b"").ljust(8 * 200, b"\0"))
                     chain = [where(w) for w in words if any(b <= w < b + 0x10000000 for b in modules)]
                     chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
                     file_log.write(f"{time.time() - start:7.3f} VALLOC {name} requested={requested} size={size:#x} "
