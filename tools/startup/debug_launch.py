@@ -685,6 +685,8 @@ def main():
                     late_hits[ex_addr] = late_hits.get(ex_addr, 0) + 1
                     k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
                     continue
+                log(f"{time.time() - start:7.3f} X2W_LOG_AT late hit at {where(ex_addr)} on thread {tid}: "
+                    f"thread context unavailable (error {k32.GetLastError()}), handled as a breakpoint")
             if ex_code == 0x80000004 and tid in stepping:
                 addr = stepping.pop(tid)
                 if addr in breakpoints:
