@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <intrin.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
@@ -41,6 +42,30 @@ unsigned long debug_heap_flags()
 }
 
 constexpr int kCalls = 7;
+constexpr int kLogCalls = 19;
+constexpr std::uint64_t kLogToken = 0x1122334455660000;
+
+__declspec(noinline) std::uint64_t log_site(const std::uint64_t* words, std::uint64_t token, std::uint64_t marker)
+{
+    return words[0] == 0x1122334455667788 && token >= kLogToken ? marker : 0;
+}
+
+void call_log_site()
+{
+    const std::uint64_t words[] = {0x1020304050607080, 0x1122334455667788, 0x89abcdef01234567};
+    auto* volatile call = log_site;
+    const auto address = reinterpret_cast<std::uintptr_t>(call);
+    const auto image = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    std::uint64_t total = 0;
+    for (int i = 0; i < kLogCalls; ++i) {
+        total += call(words + 1, kLogToken + i, 1);
+    }
+    // A breakpoint left armed after the cap would still have an INT3 byte here.
+    const auto opcode = *reinterpret_cast<const volatile unsigned char*>(address);
+    std::printf("debug-probe log site 0x%llx byte 0x%x calls %llu\n",
+                static_cast<unsigned long long>(address - image), static_cast<unsigned int>(opcode),
+                static_cast<unsigned long long>(total));
+}
 
 // Returns the number of export calls made, or -1 when the DLL or the export is missing.
 int call_export(const char* dll, const char* name)
@@ -66,6 +91,7 @@ int main()
     void* const range = reserve_large();
     std::printf("debug-probe reserved %s\n", range ? "ok" : "failed");
     std::printf("debug-probe heap flags 0x%lx\n", debug_heap_flags());
+    call_log_site();
     const char* const dll = std::getenv("STARTUP_DEBUG_PROBE_DLL");
     const char* const name = std::getenv("STARTUP_DEBUG_PROBE_EXPORT");
     if (dll && name) {

@@ -481,6 +481,20 @@ cmake --build --preset dev --target cpu_crc_line cpu_crc_castagnoli cpu_exe_orig
 ctest --preset dev --no-tests=error -R '^cpu_exe_aot_convert$' -V
 ```
 
+## Bounded startup debugger logging
+
+The source-built `startup_debug_probe` calls a known entry point 19 times.
+`X2W_LOG_AT` records the first two calls with a changing register, two known
+qwords at signed offsets and an unreadable address. The probe checks that all
+19 calls execute and the original opcode is restored. A second run uses the
+default limit and register list, with `X2W_COUNT` sharing the site and
+counting all 19 calls. See the [startup debugger switches](startup-runtime.md).
+
+```powershell
+cmake --build --preset dev --target startup_debug_probe
+ctest --preset dev --no-tests=error -R '^startup_debug' -V
+```
+
 ## EXE startup through the desktop runtime shims
 
 The source-built `cpu_shim_startup` EXE calls a companion DLL that links
