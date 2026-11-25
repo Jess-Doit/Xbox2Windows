@@ -1287,6 +1287,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
+| `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
@@ -1349,11 +1350,54 @@ those lifetimes intact. `unmeasured` counts tracking failures. DXGI usage can
 also include allocations outside these categories, such as swap chain and
 descriptor heap backing.
 
+`X2W_D3D12_RELEASE_RETIRED=1` ends the retained lifetime for one class: a
+texture created by device slot 27 or 127 that is two-dimensional, has one
+sample, no render-target, depth-stencil or unordered-access flag, lives in a
+default heap without heap flags and has no title memory. If the title exports
+`__XMemAllocationHooks__`, every slot 127 resource gets title memory and none is in the class; the fixture runs
+without that export. Every other resource
+keeps the lifetime described above. A resource leaves the class for good when a
+view is created for it (slots 18 to 21, also a refused one), when it is passed
+to MakeResident or Evict (slots 34 and 35), or when it is presented. Only
+wrappers can be in the class; a raw desktop pointer never is. Sampler feedback
+is not checked: no device slot of the stand-in reaches it.
+
+The final guest release signals a private desktop fence on every queue the
+stand-in created. The desktop object is released when all of those fences have
+passed and nothing else names it. A copy (list slot 17), texture copy (16) or
+resolve destination (19) that the stand-in forwards makes the list hold a
+desktop reference to each resource of the class it names, source and
+destination, until the list is Reset, fails to Close or is destroyed. A list
+that is closed and never submitted is thus discarded without any submission.
+Each submission holds the same references until its queue passes a fence
+signalled behind it. A release with no registered queue, and a hold, marker or
+submission fence that cannot be recorded, keep the resource retained. Nothing
+waits: `ExecuteCommandLists` and `Present` check and release without blocking.
+The wrapper stays allocated, and a guest that uses a resource after its final
+release is not supported with the switch. Buffers, placed and reserved
+resources, slot 133 and all resources with title memory are not in the class.
+Slot 18 (`CopyTiles`) is not forwarded at all and is outside this change.
+
 The source-built fixture reads the process-wide counters through
 `x2w_d3d12_budget_snapshot` and checks allocation sizes, final guest release,
 and slot 148 page retirement after queue completion. See
 [D3D12 budget accounting](experiments.md#d3d12-budget-accounting) for the test
 command.
+`startup_resource_retire_{warp,hardware}_debug{0,1}` use the retained column as
+the oracle that a desktop object is destroyed, and read results back through
+their own desktop queue. They cover two closed lists on one texture that are
+submitted separately after the release, a Reset or destroyed list with no
+submission (the destination stays unchanged), a second submission held behind
+its own fence, a destination released after recording (slots 17, 16 and 19), a
+list destroyed while its submission is held, a copy queue, an open list that
+D3D12 refuses to Reset and one that is destroyed, a release that no list
+refers to behind a held queue, and, in one run with the class, a buffer,
+render target, title-memory texture, viewed texture, resident texture and
+presented texture that must stay retained. The fixture-only export
+`x2w_d3d12_retire_probe` returns FALSE without the switch, like
+`x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
+runs the same steps without the switch. The hardware cases report 77 without a
+physical adapter, and the debug-layer cases report 77 where the debug layer is not installed.
 
 ## Input script
 

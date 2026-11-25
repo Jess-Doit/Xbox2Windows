@@ -153,6 +153,8 @@ struct alignas(16) WrapperOwn {
     ID3D12Resource* list_scratch;    // Current recording's rectangle-list argument scratch, owned by its desktop allocator.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
+    bool retire_when_idle;  // Resource: in the retire class (X2W_D3D12_RELEASE_RETIRED); cleared by any other use. Plain
+                            // accesses: a race needs the guest to use a resource across its own final Release.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     bool compute_pipeline;   // PipelineState: a desktop compute pipeline
     u64 compute_trace_key;   // Opt-in trace: selected slot 62 container hash
@@ -777,6 +779,25 @@ const D3D12_CLEAR_VALUE* packed_clear_value(const D3D12_CLEAR_VALUE* clear, DXGI
     return &copy;
 }
 
+bool release_retired_enabled()
+{
+    static const bool on = x2w_local::env_on("X2W_D3D12_RELEASE_RETIRED");
+    return on;
+}
+
+// The retire class of X2W_D3D12_RELEASE_RETIRED, decided once at creation from the desktop description: a committed
+// 2D texture with one sample, no render-target, depth-stencil or unordered-access use, in a default heap with no heap
+// flags, that has no title memory (with the title's __XMemAllocationHooks__ export every slot 127 resource gets title
+// memory, so none is in the class then). Every use reaches the shim through handlers that retire_hold covers or that
+// clear the flag; see docs/startup-runtime.md#d3d12-resource-budget.
+bool retire_class(const D3D12_HEAP_PROPERTIES& props, D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC& desc,
+                  const void* title_memory)
+{
+    return release_retired_enabled() && props.Type == D3D12_HEAP_TYPE_DEFAULT && heap_flags == D3D12_HEAP_FLAG_NONE &&
+           desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1 &&
+           (desc.Flags & ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == D3D12_RESOURCE_FLAG_NONE && !title_memory;
+}
+
 template <int K, int N, int R, int Desc = -1>
 __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g, u64 h)
 {
@@ -805,6 +826,11 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
         if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN)
             x2w_startup::mark_packed_stand_in(static_cast<ID3D12Resource*>(*out), requested_format);
         Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
+        if constexpr (K == device_kind && N == 27) {
+            if (kind == resource_kind && args[0])
+                child->own().retire_when_idle = retire_class(*reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(args[0]),
+                                                             static_cast<D3D12_HEAP_FLAGS>(args[1]), desc_copy, nullptr);
+        }
         if constexpr (K == device_kind && (N == 27 || N == 28 || N == 29)) {
             if (x2w_budget::enabled()) {
                 using Microsoft::WRL::ComPtr;
@@ -889,8 +915,18 @@ HRESULT __stdcall query_interface(Wrapper* self, const GUID* iid, void** out)
     return hr;
 }
 ULONG __stdcall add_ref(Wrapper* self) { return static_cast<ULONG>(InterlockedIncrement(&self->own().refs)); }
-// The wrappers and their desktop objects stay alive for the process (experiment scope).
+// The wrappers and their desktop objects stay alive for the process (experiment scope). The one exception is
+// X2W_D3D12_RELEASE_RETIRED=1: the desktop object of a resource of the retire class is freed once nothing refers to it.
+// The wrapper stays.
 void retire_placement(Wrapper* w);
+void register_retire_queue(Wrapper* queue);
+void retire_resource(Wrapper* w);
+void retire_leave_class(const void* object);
+void retire_hold(Wrapper* list, Wrapper* resource);
+void retire_drop_recording(Wrapper* list);
+void retire_discard_holds(Wrapper* list);
+void retire_note_submission(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists);
+void drain_retired_resources();
 void drop_mesh_lease_owner(Wrapper* w);
 void discard_mesh_lease_recording(ID3D12CommandList* list);
 ULONG __stdcall release(Wrapper* self)
@@ -903,8 +939,11 @@ ULONG __stdcall release(Wrapper* self)
             drop_mesh_lease_owner(self);
             retire_placement(self);
         }
-        if (self->own().kind == list_kind && self->own().real)
+        if (self->own().kind == list_kind && self->own().real) {
             discard_mesh_lease_recording(static_cast<ID3D12CommandList*>(self->own().real));
+            retire_drop_recording(self);
+        }
+        if (self->own().retire_when_idle) retire_resource(self);
     }
     return static_cast<ULONG>(refs);
 }
@@ -933,6 +972,7 @@ HRESULT __stdcall device_create_command_queue(Wrapper* self, const D3D12_COMMAND
         desc->Priority, desc->Flags, desc->NodeMask, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     *out = wrap(queue, queue_kind);
+    register_retire_queue(static_cast<Wrapper*>(*out));
     return S_OK;
 }
 
@@ -956,6 +996,7 @@ HRESULT __stdcall device_create_command_queue_x(Wrapper* self, const D3D12_COMMA
         desc->Type, desc->Priority, desc->Flags, desc->NodeMask, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     *out = wrap(queue, queue_kind);
+    register_retire_queue(static_cast<Wrapper*>(*out));
     return S_OK;
 }
 
@@ -1182,7 +1223,10 @@ template <int N>
 HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objects)
 {
     std::vector<ID3D12Pageable*> real(count);
-    for (UINT i = 0; i < count; ++i) real[i] = reinterpret_cast<ID3D12Pageable*>(unwrap(reinterpret_cast<u64>(objects[i])));
+    for (UINT i = 0; i < count; ++i) {
+        retire_leave_class(objects[i]);  // no hold tracks the residency of a desktop object
+        real[i] = reinterpret_cast<ID3D12Pageable*>(unwrap(reinterpret_cast<u64>(objects[i])));
+    }
     return N == 34 ? device_of(self)->MakeResident(count, real.data()) : device_of(self)->Evict(count, real.data());
 }
 
@@ -1577,6 +1621,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
         discard_draw_sampler_heaps(previous);
         discard_address_uploads(previous);
         discard_mesh_lease_recording(previous);
+        retire_drop_recording(self);
         if (draw_dump_frame()) draw_dumps().discard(previous);
         discard_red_producer(previous);
     }
@@ -1614,6 +1659,7 @@ HRESULT __stdcall list_close(Wrapper* self)
         discard_draw_sampler_heaps(list);
         discard_address_uploads(list);
         discard_mesh_lease_recording(list);
+        retire_drop_recording(self);
         if (draw_dump_frame()) draw_dumps().discard(list);
         discard_red_producer(list);
         static LONG failures;
@@ -2366,6 +2412,16 @@ void release_targets(Wrapper* self)
     for (const auto& known : pass.states)
         transition(static_cast<ID3D12GraphicsCommandList*>(self->own().real), known.first, known.second, D3D12_RESOURCE_STATE_COMMON);
     pass = Pass{};
+}
+
+// A dropped recording (Reset, or its list destroyed) names no resource any more. The raw pointers the pass keeps for
+// Close go first, then the holds that kept those resources alive (X2W_D3D12_RELEASE_RETIRED). Without the switch
+// nothing changes.
+void retire_drop_recording(Wrapper* list)
+{
+    if (!release_retired_enabled()) return;
+    if (list->own().pass) pass_of(list).states.clear();
+    retire_discard_holds(list);
 }
 
 // A reset list has no viewport or scissor and uses the default stencil reference.
@@ -3335,6 +3391,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
 {
     X2W_ZONE("ExecuteCommandLists");
     static LONG calls;
+    drain_retired_resources();
     if (render_mode()) {
         // A closed list stays submittable until its next Reset, as on the desktop.
         std::vector<ID3D12CommandList*> ready;
@@ -3363,6 +3420,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
             retire_address_uploads(queue, native_lists);
             retire_draw_sampler_heaps(queue, native_lists);
             note_submits(queue, wrappers);
+            retire_note_submission(queue, wrappers);
             for (Wrapper* w : wrappers) commit_list_gpu_writes(w);
             InterlockedIncrement(&render_executes);
         };
@@ -3394,6 +3452,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         if (first_calls(calls)) log("x2w-d3d12 CommandQueue::ExecuteCommandLists count=%u -> not submitted (noop lists)", count);
         return;
     }
+    // No hold or flight is recorded here: the copy handlers that create holds exist only in render mode.
     std::vector<ID3D12CommandList*> real(count);
     for (UINT i = 0; i < count; ++i) real[i] = reinterpret_cast<ID3D12CommandList*>(unwrap(reinterpret_cast<u64>(lists[i])));
     static_cast<ID3D12CommandQueue*>(self->own().real)->ExecuteCommandLists(count, real.data());
@@ -3726,6 +3785,9 @@ template <int N, int D>
 __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
 {
     Timed timed(time_view);
+    // A view keeps the resource's old lifetime, whether or not the view is created (X2W_D3D12_RELEASE_RETIRED).
+    if constexpr (N >= 18 && N <= 21) retire_leave_class(reinterpret_cast<const void*>(a));
+    if constexpr (N == 19) retire_leave_class(reinterpret_cast<const void*>(b));
     u64 args[4] = {unwrap(a), unwrap(b), unwrap(c), unwrap(d)};
     const u64 title_dest = args[D];
     args[D] = desktop_cpu_handle(args[D]);
@@ -4159,6 +4221,274 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
 #include "d3d12_memory_srv.inl"
 #include "startup_stubs/list_copy.inl"
 
+// X2W_D3D12_RELEASE_RETIRED=1 (docs/startup-runtime.md#d3d12-resource-budget): the desktop object of a retire class
+// member is released after its final guest Release once (1) the release-time fence of every queue has passed (each queue
+// owns a private fence that the Release signals) and (2) no list or submission names it: a list holds a desktop
+// reference from a forwarded copy until it is Reset, fails to Close or is destroyed, and each submission holds one until
+// its queue passes a fence signalled behind it. Nothing waits; the drain only try-locks and drops references outside
+// the lock. What cannot be recorded stays retained for the process, the lifetime without the switch.
+constexpr LONG retired_refs = -0x40000000;
+SRWLOCK retire_lock = SRWLOCK_INIT;  // a leaf: taken after draw_lock and allocator_lock, nothing is taken under it
+struct RetireQueue {
+    ID3D12CommandQueue* queue;  // no reference: release() never frees a queue object
+    ID3D12Fence* fence;  // null: no marker for this queue, so nothing retires
+    UINT64 signaled;
+};
+struct RetiredResource {
+    Wrapper* wrapper;
+    std::vector<UINT64> targets;  // per RetireQueue that existed at the Release
+};
+struct RetireFlight {
+    std::size_t queue;
+    UINT64 value;
+    std::vector<ID3D12Resource*> resources;  // one desktop reference each
+};
+std::vector<RetireQueue> retire_queues;
+std::vector<RetiredResource> retired_resources;
+std::vector<RetireFlight> retire_flights;
+std::unordered_map<Wrapper*, std::vector<ID3D12Resource*>> retire_list_holds;  // one desktop reference per entry
+volatile LONG retire_pending;  // retired_resources and retire_flights, read without the lock
+volatile LONG retire_holds;    // entries of retire_list_holds, read without the lock
+volatile LONG64 retire_freed, retire_kept;
+
+void register_retire_queue(Wrapper* queue)
+{
+    if (!release_retired_enabled() || !queue || !queue->own().real) return;
+    auto* real = static_cast<ID3D12CommandQueue*>(queue->own().real);
+    ID3D12Fence* fence = nullptr;
+    ID3D12Device* device = nullptr;
+    if (SUCCEEDED(real->GetDevice(IID_PPV_ARGS(&device)))) {
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) fence = nullptr;
+        device->Release();
+    }
+    AcquireSRWLockExclusive(&retire_lock);
+    try {
+        retire_queues.push_back({real, fence, 0});
+    } catch (const std::bad_alloc&) {
+        if (fence) fence->Release();
+    }
+    ReleaseSRWLockExclusive(&retire_lock);
+}
+
+// A use the holds do not cover (a view, residency, presentation) takes the resource out of the class for good.
+void retire_leave_class(const void* object)
+{
+    if (!release_retired_enabled()) return;
+    if (Wrapper* w = as_wrapper(object)) w->own().retire_when_idle = false;
+}
+
+// After a copy, texture copy or resolve was forwarded to the desktop list: the list keeps a desktop reference to the
+// resource until its recording is dropped. Only wrappers are members of the class, so a raw desktop pointer is never
+// held. Assumption, not proven: the guest has no raw pointer to the desktop object of a class member.
+void retire_hold(Wrapper* list, Wrapper* resource)
+{
+    if (!resource || !resource->own().retire_when_idle) return;
+    auto* real = static_cast<ID3D12Resource*>(resource->own().real);
+    bool held = false;
+    if (real) {
+        AcquireSRWLockExclusive(&retire_lock);
+        try {
+            auto& held_by_list = retire_list_holds[list];
+            if (std::find(held_by_list.begin(), held_by_list.end(), real) != held_by_list.end()) {
+                held = true;
+            } else {
+                held_by_list.reserve(held_by_list.size() + 1);
+                real->AddRef();
+                held_by_list.push_back(real);
+                InterlockedIncrement(&retire_holds);
+                held = true;
+            }
+        } catch (const std::bad_alloc&) {
+        }
+        ReleaseSRWLockExclusive(&retire_lock);
+    }
+    // The guest still references the resource in this call, so it cannot be retired yet: leave the class instead.
+    if (!held) resource->own().retire_when_idle = false;
+}
+
+void retire_discard_holds(Wrapper* list)
+{
+    if (!InterlockedCompareExchange(&retire_holds, 0, 0)) return;
+    std::vector<ID3D12Resource*> dropped;
+    AcquireSRWLockExclusive(&retire_lock);
+    if (const auto found = retire_list_holds.find(list); found != retire_list_holds.end()) {
+        dropped = std::move(found->second);
+        retire_list_holds.erase(found);
+        InterlockedAdd(&retire_holds, -static_cast<LONG>(dropped.size()));
+    }
+    ReleaseSRWLockExclusive(&retire_lock);
+    for (ID3D12Resource* resource : dropped) resource->Release();
+}
+
+// Right after ExecuteCommandLists: the lists' held resources stay referenced until the queue passes a fence signalled
+// behind the submission. If that fence cannot be recorded or signalled the references are kept for the process.
+void retire_note_submission(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
+{
+    if (!InterlockedCompareExchange(&retire_holds, 0, 0)) return;
+    std::vector<ID3D12Resource*> named;
+    AcquireSRWLockExclusive(&retire_lock);
+    bool room = true;
+    try {
+        for (Wrapper* list : lists) {
+            const auto found = retire_list_holds.find(list);
+            if (found == retire_list_holds.end()) continue;
+            for (ID3D12Resource* resource : found->second)
+                if (std::find(named.begin(), named.end(), resource) == named.end()) named.push_back(resource);
+        }
+        retire_flights.reserve(retire_flights.size() + 1);
+    } catch (const std::bad_alloc&) {
+        room = false;
+    }
+    bool recorded = false;
+    if (room && !named.empty()) {
+        std::size_t index = 0;
+        while (index < retire_queues.size() && retire_queues[index].queue != queue) ++index;
+        if (index < retire_queues.size() && retire_queues[index].fence) {
+            RetireQueue& q = retire_queues[index];
+            if (SUCCEEDED(queue->Signal(q.fence, q.signaled + 1))) {
+                for (ID3D12Resource* resource : named) resource->AddRef();
+                ++q.signaled;
+                retire_flights.push_back({index, q.signaled, std::move(named)});
+                InterlockedIncrement(&retire_pending);
+                recorded = true;
+            }
+        }
+    }
+    if (!recorded && (!room || !named.empty())) {
+        // Keep everything the lists name for the process; no allocation is needed to do so.
+        for (Wrapper* list : lists)
+            if (const auto found = retire_list_holds.find(list); found != retire_list_holds.end())
+                for (ID3D12Resource* resource : found->second) resource->AddRef();
+        InterlockedIncrement64(&retire_kept);
+    }
+    ReleaseSRWLockExclusive(&retire_lock);
+    if (!recorded && (!room || !named.empty())) {
+        static LONG reported;
+        if (first_calls(reported, 4)) log("x2w-d3d12 retire: a submission could not be fenced; its resources stay retained");
+    }
+}
+
+// Called by the final Release of a resource of the class.
+void retire_resource(Wrapper* w)
+{
+    if (w->own().kind != resource_kind || !w->own().real) return;
+    RetiredResource item{w, {}};
+    bool queued = false;
+    AcquireSRWLockExclusive(&retire_lock);
+    try {
+        // Without a registered queue nothing orders a marker: keep the resource. Every queue needs its fence.
+        queued = !retire_queues.empty();
+        for (const RetireQueue& q : retire_queues) queued = queued && q.fence;
+        if (queued) {
+            item.targets.reserve(retire_queues.size());
+            retired_resources.reserve(retired_resources.size() + 1);
+            for (RetireQueue& q : retire_queues) {
+                if (FAILED(q.queue->Signal(q.fence, q.signaled + 1))) {
+                    queued = false;
+                    break;
+                }
+                item.targets.push_back(++q.signaled);
+            }
+        }
+        if (queued) {
+            retired_resources.push_back(std::move(item));
+            InterlockedIncrement(&retire_pending);
+        }
+    } catch (const std::bad_alloc&) {
+        queued = false;
+    }
+    ReleaseSRWLockExclusive(&retire_lock);
+    if (!queued) InterlockedIncrement64(&retire_kept);  // stays retained, as without the switch
+}
+
+// Never blocks: a contended lock or an unfinished queue leaves the work for the next call.
+void drain_retired_resources()
+{
+    if (!InterlockedCompareExchange(&retire_pending, 0, 0)) return;
+    constexpr std::size_t batch = 256;
+    std::vector<ID3D12Resource*> dropped;
+    try {
+        dropped.reserve(batch);
+    } catch (const std::bad_alloc&) {
+        return;
+    }
+    if (!TryAcquireSRWLockExclusive(&retire_lock)) return;
+    for (std::size_t i = 0; i < retired_resources.size() && dropped.size() < batch;) {
+        RetiredResource& item = retired_resources[i];
+        bool reached = item.targets.size() <= retire_queues.size();
+        for (std::size_t q = 0; q < item.targets.size() && reached; ++q)
+            reached = retire_queues[q].fence->GetCompletedValue() >= item.targets[q];
+        if (!reached) {
+            ++i;
+            continue;
+        }
+        Wrapper* w = item.wrapper;
+        // Claim the reference count so that a late AddRef cannot bring the wrapper back while its object goes.
+        if (InterlockedCompareExchange(&w->own().refs, retired_refs, 0) == 0) {
+            dropped.push_back(static_cast<ID3D12Resource*>(w->own().real));
+            w->own().real = nullptr;
+        } else {
+            InterlockedIncrement64(&retire_kept);  // referenced again after its final Release
+        }
+        if (i + 1 != retired_resources.size()) item = std::move(retired_resources.back());
+        retired_resources.pop_back();
+        InterlockedDecrement(&retire_pending);
+    }
+    for (std::size_t i = 0; i < retire_flights.size() && dropped.size() < batch;) {
+        RetireFlight& flight = retire_flights[i];
+        if (retire_queues[flight.queue].fence->GetCompletedValue() < flight.value) {
+            ++i;
+            continue;
+        }
+        // A flight holds at most a list's resources; it may overshoot the batch by that much.
+        dropped.insert(dropped.end(), flight.resources.begin(), flight.resources.end());
+        if (i + 1 != retire_flights.size()) flight = std::move(retire_flights.back());
+        retire_flights.pop_back();
+        InterlockedDecrement(&retire_pending);
+    }
+    ReleaseSRWLockExclusive(&retire_lock);
+    for (ID3D12Resource* resource : dropped) {
+        resource->Release();
+        const LONG64 total = InterlockedIncrement64(&retire_freed);
+        if (total <= 8 || total % 1000 == 0) log("x2w-d3d12 retire: %lld desktop references dropped", total);
+    }
+}
+
+// Fixture probe (startup_resource_retire): what still names a resource of the class by its raw desktop pointer, how many
+// resources the open recording of a list moved out of COMMON, and how many it holds. Counts entries only.
+struct RetireProbe {
+    unsigned cache_entries;
+    unsigned list_states;
+    unsigned list_holds;
+};
+extern "C" __declspec(dllexport) BOOL x2w_d3d12_retire_probe(void* resource, void* list, RetireProbe* out)
+{
+    if (!out) return FALSE;
+    *out = {};
+    if (!release_retired_enabled()) return FALSE;  // like x2w_d3d12_budget_snapshot: nothing to report without the switch
+    if (Wrapper* r = as_wrapper(resource); r && r->own().kind == resource_kind && r->own().real) {
+        auto* real = static_cast<ID3D12Resource*>(r->own().real);
+        AcquireSRWLockExclusive(&draw_lock);
+        out->cache_entries += static_cast<unsigned>(texture_uploads().count(real));
+        ReleaseSRWLockExclusive(&draw_lock);
+        AcquireSRWLockShared(&target_lock);
+        for (const auto& view : view_targets()) out->cache_entries += view.second.resource == real;
+        ReleaseSRWLockShared(&target_lock);
+        AcquireSRWLockShared(&pending_writes_lock);
+        for (const auto& writes : pending_gpu_writes())
+            out->cache_entries += static_cast<unsigned>(std::count(writes.second.begin(), writes.second.end(), real));
+        ReleaseSRWLockShared(&pending_writes_lock);
+    }
+    if (Wrapper* l = as_wrapper(list); l && l->own().kind == list_kind) {
+        if (l->own().pass) out->list_states = static_cast<unsigned>(pass_of(l).states.size());
+        AcquireSRWLockShared(&retire_lock);
+        if (const auto found = retire_list_holds.find(l); found != retire_list_holds.end())
+            out->list_holds = static_cast<unsigned>(found->second.size());
+        ReleaseSRWLockShared(&retire_lock);
+    }
+    return TRUE;
+}
+
 // The title exports __XMemAllocationHooks__ = {alloc(size, attributes), free(ptr, attributes), ...}.
 // Its alloc routine selects a hook chain by allocatorId (attribute bits 16-23). Around the creation
 // of its two display render targets the title pushes a bump allocator for allocatorId 0x80 that
@@ -4492,6 +4822,7 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     Wrapper* w = wrap(resource, resource_kind);
     w->own().budget = x2w_budget::committed(device_of(self), resource, props->Type);
     w->own().title_memory = title_memory;
+    w->own().retire_when_idle = retire_class(*props, flags, copy, title_memory);
     note_resource(w, desc, info.SizeInBytes != ~0ull ? info.SizeInBytes : 0);
     *out = w;
     return S_OK;
@@ -4691,6 +5022,13 @@ void report_budget(ID3D12CommandQueue* queue)
 // console present. Nothing is shown yet; frames are counted and a heartbeat is logged.
 HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_parameters, const void* present_parameters)
 {
+    // First, before anything reads or copies the surface: a presented resource keeps its old lifetime.
+    if (release_retired_enabled() && planes && plane_parameters) {
+        const auto* words = static_cast<const u64*>(plane_parameters);
+        if (x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
+            retire_leave_class(*reinterpret_cast<void* const*>(words[2]));
+    }
+    drain_retired_resources();
     Timed timed(time_present);
     X2W_ZONE("Present");
     X2W_FRAME_MARK;

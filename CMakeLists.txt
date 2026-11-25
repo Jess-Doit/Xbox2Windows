@@ -1325,6 +1325,25 @@ foreach(backend IN ITEMS warp hardware)
     endforeach()
 endforeach()
 
+# X2W_D3D12_RELEASE_RETIRED=1 frees the desktop object of a committed 2D texture only when no recorded list, no submission
+# and no release-time fence still refers to it (docs/startup-runtime.md#d3d12-resource-budget). The `off` case runs
+# without the switch and expects the lifetime of the budget fixture: every released resource stays retained.
+add_executable(startup_resource_retire tests/startup_resource_retire.cpp)
+target_include_directories(startup_resource_retire PRIVATE src)
+target_compile_features(startup_resource_retire PRIVATE cxx_std_17)
+target_link_libraries(startup_resource_retire PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    foreach(debug IN ITEMS 0 1)
+        set(retire_env "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=${debug}")
+        add_test(NAME startup_resource_retire_${backend}_debug${debug} COMMAND startup_resource_retire ${backend})
+        set_tests_properties(startup_resource_retire_${backend}_debug${debug} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "${retire_env};X2W_D3D12_RELEASE_RETIRED=1")
+    endforeach()
+    add_test(NAME startup_resource_retire_off_${backend} COMMAND startup_resource_retire ${backend} off)
+    set_tests_properties(startup_resource_retire_off_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_BUDGET=1;X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+endforeach()
+
 # GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
 add_executable(startup_compute_binding_trace tests/startup_compute_binding_trace.cpp)
 target_compile_features(startup_compute_binding_trace PRIVATE cxx_std_20)
@@ -3090,6 +3109,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: v_add/sub/subrev_co_u32 against ISA references.
     add_test(NAME startup_gfx2hlsl_add_sub_co_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_add_sub_co_check.py")
+    # Startup shader translator: v_{add,sub,subrev}_co_ci_u32 carry/borrow-in and out.
+    add_test(NAME startup_gfx2hlsl_add_sub_co_ci_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_add_sub_co_ci_check.py")
     # Startup shader translator: s_*_saveexec with D == S0 reads S0 before writing D.
     add_test(NAME startup_gfx2hlsl_saveexec_same_reg_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_saveexec_same_reg_check.py")

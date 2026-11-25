@@ -36,6 +36,14 @@ cmake --build --preset release --target startup_resource_budget -j 2
 ctest --preset release --no-tests=error -j 1 -R '^startup_resource_budget_' -V
 ```
 
+`startup_resource_retire` covers `X2W_D3D12_RELEASE_RETIRED=1`
+([class and fences](startup-runtime.md#d3d12-resource-budget)):
+
+```powershell
+cmake --build --preset release --target startup_resource_retire -j 2
+ctest --preset release --no-tests=error -j 1 -R '^startup_resource_retire_' -V
+```
+
 The test runs on WARP and hardware with the debug layer on and off. The
 [budget heartbeat](startup-runtime.md#d3d12-resource-budget) correlates these
 counts with DXGI usage. The fixture measures the accounting and retirement
