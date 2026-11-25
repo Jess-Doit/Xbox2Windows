@@ -167,7 +167,8 @@ HRESULT WINAPI get_result_size(void*, Block* block, std::size_t* out)
     const auto* op = find(block);
     if (!op) return E_INVALIDARG;
     if (op->status == E_PENDING) return E_PENDING;
-    if (out) *out = SUCCEEDED(op->status) ? op->bytes : 0;
+    // The installed runtime reports 0 bytes once the result has been retrieved.
+    if (out) *out = SUCCEEDED(op->status) && !op->consumed ? op->bytes : 0;
     return op->status;
 }
 HRESULT WINAPI begin(void*, Block* block, void* context, const void* id, const char*, Provider p)
@@ -373,6 +374,8 @@ int run(bool system)
         return fail("a second completion-port dispatch found more work");
     if (!system && (unpumped.status != S_OK || final_phase.status != S_OK))
         return fail("stand-in status after Complete was not S_OK");
+    if (!system && (unpumped.size != sizeof payload || final_phase.size != 0))
+        return fail("stand-in result size was not 8 before and 0 after retrieval");
     std::puts(system ? "PASS: system manual completion port" : "PASS: controlled manual completion port");
     return 0;
 }
