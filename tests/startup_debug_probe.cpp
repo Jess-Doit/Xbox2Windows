@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <thread>
+#include <vector>
 
 namespace {
 volatile int reached;
@@ -67,6 +70,43 @@ void call_log_site()
                 static_cast<unsigned long long>(total));
 }
 
+constexpr int kThreads = 8;
+constexpr int kThreadCalls = 2000;
+
+__declspec(noinline) std::uint64_t threaded_log_site(std::uint64_t value)
+{
+    return value & 1;
+}
+
+// Eight threads released together call one site, so INT3 events from several threads can be
+// queued when a hit limit removes its breakpoint.
+void call_threaded_log_site()
+{
+    auto* volatile call = threaded_log_site;
+    const auto address = reinterpret_cast<std::uintptr_t>(call);
+    const auto image = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<std::uint64_t> total{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&] {
+            ++ready;
+            while (!go.load()) YieldProcessor();
+            std::uint64_t mine = 0;
+            for (int i = 0; i < kThreadCalls; ++i) mine += call(1);
+            total += mine;
+        });
+    }
+    while (ready.load() != kThreads) YieldProcessor();
+    go = true;
+    for (auto& thread : threads) thread.join();
+    const auto opcode = *reinterpret_cast<const volatile unsigned char*>(address);
+    std::printf("debug-probe threaded log site 0x%llx byte 0x%x calls %llu\n",
+                static_cast<unsigned long long>(address - image), static_cast<unsigned int>(opcode),
+                static_cast<unsigned long long>(total.load()));
+}
+
 // Returns the number of export calls made, or -1 when the DLL or the export is missing.
 int call_export(const char* dll, const char* name)
 {
@@ -92,6 +132,7 @@ int main()
     std::printf("debug-probe reserved %s\n", range ? "ok" : "failed");
     std::printf("debug-probe heap flags 0x%lx\n", debug_heap_flags());
     call_log_site();
+    call_threaded_log_site();
     const char* const dll = std::getenv("STARTUP_DEBUG_PROBE_DLL");
     const char* const name = std::getenv("STARTUP_DEBUG_PROBE_EXPORT");
     if (dll && name) {

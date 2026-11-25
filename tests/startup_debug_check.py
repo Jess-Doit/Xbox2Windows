@@ -157,7 +157,8 @@ def main(probe, calls_dll):
         # Log two out of 19 calls, even with the usual file hooks off. RDX changes each call,
         # RCX points into a known array, and R8 - 1 is the unreadable null address.
         entry = f"{log_rva:#x}@2:rdx;[rcx+8];[rcx-8];[r8-1]"
-        malformed = ("xyz", f"{log_rva:x}@0", f"{log_rva:x}:rdx;[rcx*8]", f"{log_rva:x}:rip", f"{log_rva:x}:rdx;rdx")
+        malformed = ("xyz", f"{log_rva:x}@0", f"{log_rva:x}:rdx;[rcx*8]", f"{log_rva:x}:rip", f"{log_rva:x}:rdx;rdx",
+                     f"{log_rva:x}:[rcx+8];[RCX+0x8]")
         unusable = (0xffffffff, 0, sites[0])
         out, logdir = run(probe, work, "log-at",
                           {"X2W_LOG_AT": ",".join((*malformed, entry, *(f"{rva:x}:rax" for rva in unusable), entry))},
@@ -187,6 +188,21 @@ def main(probe, calls_dll):
             assert set(registers) == LOG_REGISTERS, record
             assert int(registers["rdx"], 16) == LOG_TOKEN + i and registers["r8"] == "0x1", record
         assert log_probe_state(logdir) == (log_rva, 0xcc), text(logdir / "stdout.txt")
+
+        # Eight threads hit one site 16000 times with a limit of 1. INT3 events that other threads
+        # queued before the breakpoint was removed must resume, not stop the run as asserts.
+        found = re.search(r"^debug-probe threaded log site (0x[0-9a-f]+) byte (0x[0-9a-f]+) calls (\d+)$",
+                          text(logdir / "stdout.txt"), re.M)
+        assert found, text(logdir / "stdout.txt")
+        threaded_rva = int(found[1], 16)
+        for attempt in range(3):
+            out, logdir = run(probe, work, f"log-at-threads-{attempt}", {"X2W_LOG_AT": f"{threaded_rva:x}@1:rcx"})
+            stdout = text(logdir / "stdout.txt")
+            assert "process exited with 0x00000000" in out and "debugger stop " not in text(logdir / "events.txt"), out
+            assert f"LOG_AT hit counts: +{threaded_rva:x} x1\n" in out, out
+            assert f"debug-probe threaded log site {threaded_rva:#x} byte" in stdout and "calls 16000\n" in stdout, stdout
+            assert f"breakpoint at {image}+{threaded_rva:#x}" not in text(logdir / "events.txt"), text(logdir / "events.txt")
+            assert len([line for line in text(logdir / "files.txt").splitlines() if " LOG_AT " in line]) == 1
 
         # Call hooks: off by default, so the 7 export calls stop nothing; with --trace-calls 1 the
         # launcher counts each of them (the positive control that the probe reaches the hook).

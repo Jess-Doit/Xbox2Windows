@@ -76,15 +76,17 @@ def parse_log_at(value, log):
             fields = []
             for item in items.split(";") if colon else LOG_REGS:
                 item = item.strip()
-                if any(item == field[0] for field in fields):
-                    raise ValueError(f"duplicate item {item!r}")
                 if item in LOG_REGS:
-                    fields.append((item, LOG_REGS[item], None))
-                    continue
-                memory = LOG_ITEM.fullmatch(item)
-                if not memory or memory[1] not in LOG_REGS:
-                    raise ValueError(f"invalid item {item!r}")
-                fields.append((item, LOG_REGS[memory[1]], int(memory[2], 16)))
+                    field = (item, LOG_REGS[item], None)
+                else:
+                    memory = LOG_ITEM.fullmatch(item)
+                    if not memory or memory[1] not in LOG_REGS:
+                        raise ValueError(f"invalid item {item!r}")
+                    field = (item, LOG_REGS[memory[1]], int(memory[2], 16))
+                # Compare the register and offset, so [rcx+8] and [rcx+0x8] are the same item.
+                if any(field[1:] == earlier[1:] for earlier in fields):
+                    raise ValueError(f"duplicate item {item!r}")
+                fields.append(field)
             points[rva] = (max_hits, fields)
         except ValueError as error:
             log(f"X2W_LOG_AT ignored {entry!r}: {error}")
@@ -406,6 +408,8 @@ def main():
         print(f"  bink luma plane -> bink_luma.png (pointer {pointer:#x}, pitch {pitch})")
 
     breakpoints = {}  # addr -> original byte
+    retired = set()  # X2W_LOG_AT breakpoints removed at their hit limit
+    late_hits = {}  # retired addr -> INT3 events that arrived after the removal
     returns = {}  # addr -> list of (tid, rsp after return, description)
     stepping = {}  # tid -> addr to re-arm
     file_log = open(os.path.join(logdir, "files.txt"), "w", encoding="utf-8") if trace or log_at else None
@@ -519,6 +523,7 @@ def main():
         if (point and logged_hits[rva] == point[0] and addr not in hooks and not returns.get(addr)
                 and write(addr, breakpoints[addr])):
             del breakpoints[addr]
+            retired.add(addr)
             set_ctx(thread)
             return True
         # Step over the original instruction, then re-arm.
@@ -670,6 +675,16 @@ def main():
                 handle_breakpoint(tid, ex_addr)
                 k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
                 continue
+            if ex_code == 0x80000003 and ex_addr in retired:
+                # Another thread executed this INT3 before the hit limit restored the original byte,
+                # and its event arrived after that. Rewind and run the restored instruction.
+                thread, ctx = get_ctx(tid)
+                if thread:
+                    struct.pack_into("<Q", ctx, 0xF8, ex_addr)
+                    set_ctx(thread)
+                    late_hits[ex_addr] = late_hits.get(ex_addr, 0) + 1
+                    k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
+                    continue
             if ex_code == 0x80000004 and tid in stepping:
                 addr = stepping.pop(tid)
                 if addr in breakpoints:
@@ -819,6 +834,9 @@ def main():
                                            for item in os.environ["X2W_COUNT"].split(",") if item))
     if log_at:
         print("  LOG_AT hit counts: " + ", ".join(f"+{rva:x} x{logged_hits.get(rva, 0)}" for rva in log_at))
+        if late_hits:
+            print("  LOG_AT late hits resumed after the limit: " +
+                  ", ".join(f"+{addr - main_base:x} x{n}" for addr, n in sorted(late_hits.items())))
     if offline:
         print(f"  offline: {sum(denied.values())} network opens refused" +
               ("" if not denied else " (" + ", ".join(f"{k} x{v}" for k, v in list(denied.items())[:6]) + ")"))
